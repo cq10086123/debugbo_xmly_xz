@@ -48,12 +48,14 @@ def _admin_register_fail(ip: str) -> None:
 from db.session import SessionLocal
 from db.models import (
     Admin, AdminToken, Card, ApiConfig, Interface, LocalTask, BackendXmAccount,
+    Session as CardSession,
 )
 from api.deps import get_current_admin
 from api.card_helpers import card_public_info, is_expired, dump_bound_interfaces, _aware
 from core import config as _config
 from core import login as login_module
 from core import account_manager as _am
+from core import device_binding as dvb
 from db.init_db import log_card_event
 
 router = APIRouter(tags=["管理后台"])
@@ -73,6 +75,7 @@ class CardGenerateRequest(BaseModel):
     interface_names: list[str] | None = None  # 绑定接口名列表；None/空 = 不限制
     inject_xm_cookie: bool = False      # 生成时是否把后端供体池账号复制进新卡（免前端扫码）
     download_mode: str | None = None   # 下载模式：server/local/both；None = both（不限制）
+    max_devices: int | None = None     # 设备绑定：每席位允许设备数（默认 1）
 
 
 class CardInjectRequest(BaseModel):
@@ -86,6 +89,7 @@ class CardPatchRequest(BaseModel):
     valid_days: int | None = None
     interface_names: list[str] | None = None  # 传数组则覆盖绑定（空数组=取消限制）；不传则不变
     download_mode: str | None = None   # 下载模式：server/local/both；传 None 则不变，传 'both'/非法值 → 取消限制
+    max_devices: int | None = None     # 设备绑定：每席位允许设备数（1~10）；不传则不变
 
 
 class CardRenewRequest(BaseModel):
@@ -233,6 +237,8 @@ async def generate_cards(req: CardGenerateRequest, _: bool = Depends(get_current
         bound_str = _validate_interface_names(db, req.interface_names)
         # 下载模式：仅允许 server/local，其它（含 both/None/非法）按 both 处理（存 NULL）
         dm = req.download_mode if req.download_mode in ("server", "local") else None
+        # 设备绑定数：1~10，缺省 1
+        md = req.max_devices if req.max_devices and 1 <= req.max_devices <= 10 else 1
         created = []
         created_ids = []
         for _ in range(req.count):
@@ -245,6 +251,7 @@ async def generate_cards(req: CardGenerateRequest, _: bool = Depends(get_current
                 note=req.note,
                 bound_interfaces=bound_str,
                 download_mode=dm,
+                max_devices=md,
             )
             db.add(card)
             db.flush()
@@ -354,6 +361,11 @@ async def patch_card(card_id: int, req: CardPatchRequest, _: bool = Depends(get_
             # 传 'both'/非法值 → NULL（=both，取消限制）；server/local 则限定
             card.download_mode = req.download_mode if req.download_mode in ("server", "local") else None
 
+        if req.max_devices is not None:
+            if req.max_devices < 1 or req.max_devices > 10:
+                raise HTTPException(status_code=400, detail="max_devices 需在 1~10 之间")
+            card.max_devices = req.max_devices
+
         # 修改到期时间/有效天数后，若按新值实际未过期，复活 expired 状态
         # （is_expired 对 status==expired 恒真，必须绕开它按日期直接判断）
         if card.status == "expired":
@@ -454,9 +466,95 @@ async def delete_card(card_id: int, _: bool = Depends(get_current_admin)):
         if not card:
             raise HTTPException(status_code=404, detail="卡密不存在")
         db.query(LocalTask).filter_by(card_id=card.id).delete(synchronize_session=False)
-        db.delete(card)  # 级联删除 sessions / tasks / records / accounts
+        db.delete(card)  # 级联删除 sessions / devices / tasks / records / accounts
         db.commit()
         return {"success": True, "message": "已删除"}
+    finally:
+        db.close()
+
+
+# ════════════════════════════════════════
+#  设备绑定管理（卡密席位 × 设备）
+# ════════════════════════════════════════
+
+
+class DeviceUnbindRequest(BaseModel):
+    device_id: str
+    client_type: str | None = None      # web/extension；空 = 两个席位都解绑
+
+
+@router.get("/cards/{card_id}/devices")
+async def list_card_devices(card_id: int, _: bool = Depends(get_current_admin)):
+    """列出卡密的席位绑定详情（web/extension 各自的设备、活跃时间、IP）与在线会话数"""
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(id=card_id).first()
+        if not card:
+            raise HTTPException(status_code=404, detail="卡密不存在")
+        devices = dvb.device_binding_status(card)
+        active_sessions = (
+            db.query(CardSession)
+            .filter_by(card_id=card.id, is_active=True)
+            .count()
+        )
+        return {
+            "success": True,
+            "card_id": card.id,
+            "max_devices": dvb.get_max_devices(card),
+            "binding_enabled": dvb.device_binding_enabled(),
+            "active_sessions": active_sessions,
+            "devices": devices,
+        }
+    finally:
+        db.close()
+
+
+@router.post("/cards/{card_id}/devices/unbind")
+async def unbind_card_device(card_id: int, req: DeviceUnbindRequest, _: bool = Depends(get_current_admin)):
+    """解绑单个设备：删除席位绑定并失效其全部会话（该设备需重新登录，不占换绑语义）"""
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(id=card_id).first()
+        if not card:
+            raise HTTPException(status_code=404, detail="卡密不存在")
+        ct = dvb.normalize_client_type(req.client_type) if req.client_type else None
+        if req.client_type and not ct:
+            raise HTTPException(status_code=400, detail="client_type 非法（web / extension）")
+        n = dvb.unbind_device(db, card, req.device_id.strip(), ct)
+        if not n:
+            raise HTTPException(status_code=404, detail="该设备未绑定在此卡密")
+        db.commit()
+        return {"success": True, "message": "已解绑并下线该设备", "unbound": n}
+    finally:
+        db.close()
+
+
+@router.post("/cards/{card_id}/devices/unbind-all")
+async def unbind_all_card_devices(card_id: int, _: bool = Depends(get_current_admin)):
+    """解绑全部设备并踢下线全部会话（用户换机/售后专用）"""
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(id=card_id).first()
+        if not card:
+            raise HTTPException(status_code=404, detail="卡密不存在")
+        n = dvb.unbind_all(db, card)
+        db.commit()
+        return {"success": True, "message": f"已解绑 {n} 台设备并踢下线全部会话", "unbound": n}
+    finally:
+        db.close()
+
+
+@router.post("/cards/{card_id}/kick")
+async def kick_card_sessions(card_id: int, _: bool = Depends(get_current_admin)):
+    """仅踢下线（保留设备绑定）：用户在本机重新登录即可恢复"""
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(id=card_id).first()
+        if not card:
+            raise HTTPException(status_code=404, detail="卡密不存在")
+        n = dvb.kick_all_sessions(db, card)
+        db.commit()
+        return {"success": True, "message": f"已踢下线 {n} 个会话（设备绑定保留）", "kicked": n}
     finally:
         db.close()
 
@@ -502,6 +600,11 @@ async def update_config(req: ConfigUpdateRequest, _: bool = Depends(get_current_
         rows = db.query(ApiConfig).all()
         cfg = {r.cfg_key: r.cfg_value for r in rows}
         cfg["admin_path"] = _config.get_admin_path()
+        # 设备绑定/风控配置走 5s 短缓存：保存后立即失效，开关即时生效
+        try:
+            dvb.invalidate_cfg_cache()
+        except Exception:
+            pass
         return {"success": True, "config": cfg}
     finally:
         db.close()

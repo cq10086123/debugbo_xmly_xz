@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { getDeviceId } from './deviceId'
 
 // 业务 token（卡密登录）
 const BIZ_KEY = 'auth_token'
@@ -51,19 +52,22 @@ export async function probeAdminPath(p) {
   }
 }
 
-function makeInstance(baseURL, tokenGetter, onUnauthorized) {
+function makeInstance(baseURL, tokenGetter, onUnauthorized, deviceHeader) {
   const inst = axios.create({ baseURL, timeout: 60000 })
   inst.interceptors.request.use((cfg) => {
     const t = tokenGetter()
     if (t) cfg.headers = cfg.headers || {}
     if (t) cfg.headers.Authorization = `Bearer ${t}`
+    // 设备绑定：业务接口统一携带 X-Device-Id（服务端开关关闭时忽略此头）
+    if (deviceHeader && t) cfg.headers['X-Device-Id'] = getDeviceId()
     return cfg
   })
   inst.interceptors.response.use(
     (resp) => resp,
     (err) => {
       if (err.response && err.response.status === 401) {
-        onUnauthorized()
+        // 把服务端语义（已在其他设备登录/登录过期等）交给回调提示
+        onUnauthorized(err.response.data && err.response.data.detail)
       }
       return Promise.reject(err)
     }
@@ -71,11 +75,11 @@ function makeInstance(baseURL, tokenGetter, onUnauthorized) {
   return inst
 }
 
-// 业务接口实例（带卡密 token）—— baseURL /api
+// 业务接口实例（带卡密 token + 设备 ID 头）—— baseURL /api
 export const bizApi = makeInstance(
   '/api',
   getBizToken,
-  () => {
+  (detail) => {
     setBizToken('')
     // 同步清空 Pinia 登录态，避免守卫短时间内仍判已登录导致 API 层反复 401/重定向
     import('../stores/auth').then((m) => {
@@ -83,11 +87,16 @@ export const bizApi = makeInstance(
       s.bizToken = ''
       s.card = null
     }).catch(() => {})
+    // 服务端给了明确原因（被顶下线/过期/风控）时提示用户，避免"莫名其妙被踢"
+    if (detail && typeof detail === 'string') {
+      import('../utils/toast').then((m) => m.useToast().error(detail)).catch(() => {})
+    }
     if (location.hash.startsWith(`#/${getAdminPath()}`)) return
     if (location.pathname !== '/login' && location.hash !== '#/login') {
       location.hash = '#/login'
     }
-  }
+  },
+  true
 )
 
 // 管理接口实例（带 admin token）—— baseURL 动态：/api/{admin_path}

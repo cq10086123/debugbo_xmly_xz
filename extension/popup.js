@@ -10,8 +10,26 @@ function setMsg(text, cls) {
   el.textContent = text || ''
   el.className = 'status ' + (cls || '')
 }
-function getCfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token', 'card'], r)) }
+function getCfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token', 'card', 'deviceId'], r)) }
 function setCfg(obj) { return new Promise(r => chrome.storage.local.set(obj, r)) }
+
+// ── 设备 ID（设备绑定用）：首次生成后持久化，退出登录不清除 ──
+function genUuid() {
+  if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const b = new Uint8Array(16)
+  crypto.getRandomValues(b)
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const hex = Array.from(b, x => x.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`
+}
+async function ensureDeviceId() {
+  const { deviceId } = await getCfg()
+  if (deviceId) return deviceId
+  const id = genUuid()
+  await setCfg({ deviceId: id })
+  return id
+}
 
 let curCaptchaId = ''
 async function loadCaptcha(serverUrl) {
@@ -68,7 +86,7 @@ let connTimer = null
 const expandedTasks = new Set()   // 已展开明细的任务 id（1.5s 自动刷新重建 DOM 时保持展开状态）
 
 async function showMain() {
-  const { token, card } = await getCfg()
+  const { token, card, auth_error } = await getCfg()
   if (token) {
     $('loginBox').style.display = 'none'
     $('mainBox').style.display = 'block'
@@ -82,6 +100,11 @@ async function showMain() {
   } else {
     $('loginBox').style.display = 'block'
     $('mainBox').style.display = 'none'
+    // 后台检测到登录失效（被顶下线/过期/风控）时留下原因，弹窗打开即展示并清除
+    if (auth_error) {
+      setMsg(auth_error, 'err')
+      setCfg({ auth_error: null })
+    }
     if (BUILTIN_SERVER) {
       // config.js 内置了服务器地址 → 隐藏输入框，保持登录页简洁
       $('server').style.display = 'none'
@@ -116,6 +139,7 @@ $('loginBtn').onclick = async () => {
   const code = $('code').value.trim()
   if (!serverUrl || !code) { setMsg(BUILTIN_SERVER ? '请填写卡密' : '请填写服务器地址和卡密', 'err'); return }
   setMsg('登录中…')
+  const deviceId = await ensureDeviceId()
   try {
     const r = await fetch(`${serverUrl}/api/auth/login`, {
       method: 'POST',
@@ -124,6 +148,8 @@ $('loginBtn').onclick = async () => {
         code,
         captchaId: curCaptchaId,
         captcha: $('captcha').value.trim(),
+        deviceId,          // 设备绑定：本插件的设备 ID
+        client: 'extension',
       }),
     })
     const data = await r.json()

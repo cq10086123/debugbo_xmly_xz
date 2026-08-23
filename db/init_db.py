@@ -34,6 +34,7 @@ _CONFIG_KEYS = (
 def init_db():
     Base.metadata.create_all(_engine)
     _migrate_card_columns()
+    _migrate_session_columns()
     _migrate_backend_columns()
     _migrate_config_json()
     _migrate_accounts_json()
@@ -49,14 +50,32 @@ def _migrate_card_columns():
     目前补充：
     - bound_interfaces TEXT  卡密绑定的接口名列表（JSON 数组，NULL=不限制）
     - download_mode     TEXT  下载模式权限（server/local/both，NULL=both）
+    - max_devices       INTEGER  设备绑定数上限（NULL=1，见 core/device_binding.py）
     """
-    needed = {"bound_interfaces": "TEXT", "download_mode": "TEXT"}
+    needed = {"bound_interfaces": "TEXT", "download_mode": "TEXT", "max_devices": "INTEGER"}
     with _engine.connect() as conn:
         cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(cards)").fetchall()}
         for name, ddl in needed.items():
             if name not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE cards ADD COLUMN {name} {ddl}")
                 logger.info(f"cards 表补充列: {name}")
+        conn.commit()
+
+
+def _migrate_session_columns():
+    """轻量迁移：为已存在的 sessions 表补充设备绑定相关列（全部可空，存量会话不受影响）。
+
+    - client_type TEXT     登录端类型（web|extension，NULL=历史会话，设备校验放行）
+    - device_id   TEXT     登录设备 ID（NULL=历史会话）
+    - ip          TEXT     登录时出口 IP（风控用）
+    """
+    needed = {"client_type": "TEXT", "device_id": "TEXT", "ip": "TEXT"}
+    with _engine.connect() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(sessions)").fetchall()}
+        for name, ddl in needed.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
+                logger.info(f"sessions 表补充列: {name}")
         conn.commit()
 
 

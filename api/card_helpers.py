@@ -102,5 +102,6 @@ def card_public_info(card: Card) -> dict:
         "note": card.note,
         "bound_interfaces": card_bound_interfaces(card),
         "download_mode": getattr(card, "download_mode", None) or "both",
+        "max_devices": getattr(card, "max_devices", None) or 1,
         "last_login_at": card.last_login_at.isoformat() if card.last_login_at else None,
     }

@@ -15,11 +15,14 @@ const loading = ref(false)
 // 可绑定的接口清单（从接口管理拉取）
 const interfaces = ref([])
 
-const gen = reactive({ count: 1, expiry_type: 'fixed', expires_at: '', valid_days: 30, note: '', interface_names: [], inject_xm_cookie: false, download_mode: 'both', generating: false })
+const gen = reactive({ count: 1, expiry_type: 'fixed', expires_at: '', valid_days: 30, note: '', interface_names: [], inject_xm_cookie: false, download_mode: 'both', max_devices: 1, generating: false })
 const genResult = ref('')
 
 // 绑定编辑弹窗
-const bindEditor = reactive({ show: false, card: null, selected: [], download_mode: 'both', saving: false })
+const bindEditor = reactive({ show: false, card: null, selected: [], download_mode: 'both', max_devices: 1, saving: false })
+
+// 设备管理弹窗
+const devMgr = reactive({ show: false, card: null, loading: false, data: null, busy: false })
 
 async function loadInterfaces() {
   try {
@@ -58,6 +61,7 @@ async function generate() {
     if (gen.interface_names.length) payload.interface_names = [...gen.interface_names]
     if (gen.inject_xm_cookie) payload.inject_xm_cookie = true
     payload.download_mode = gen.download_mode
+    payload.max_devices = Number(gen.max_devices) || 1
     const r = await adminApi.post('/cards/generate', payload)
     if (r.data.success) {
       genResult.value = r.data.codes.join('\n')
@@ -99,6 +103,7 @@ function openBindEditor(c) {
   bindEditor.card = c
   bindEditor.selected = [...(c.bound_interfaces || [])]
   bindEditor.download_mode = c.download_mode || 'both'
+  bindEditor.max_devices = c.max_devices || 1
   bindEditor.show = true
 }
 
@@ -107,6 +112,7 @@ async function saveBinding() {
   try {
     const body = { interface_names: [...bindEditor.selected] }
     body.download_mode = bindEditor.download_mode
+    body.max_devices = Number(bindEditor.max_devices) || 1
     const r = await adminApi.patch(`/cards/${bindEditor.card.id}`, body)
     if (r.data.success) {
       toast.success(bindEditor.selected.length ? '绑定已更新' : '已取消接口限制')
@@ -115,6 +121,56 @@ async function saveBinding() {
     } else toast.error(r.data.error || '保存失败')
   } catch (e) { toast.error(e.response?.data?.detail || '保存失败') }
   finally { bindEditor.saving = false }
+}
+
+// ── 设备绑定管理 ──
+async function openDeviceMgr(c) {
+  devMgr.card = c
+  devMgr.show = true
+  await loadDevices()
+}
+
+async function loadDevices() {
+  if (!devMgr.card) return
+  devMgr.loading = true
+  try {
+    const r = await adminApi.get(`/cards/${devMgr.card.id}/devices`)
+    if (r.data.success) devMgr.data = r.data
+  } catch (e) { toast.error(e.response?.data?.detail || '设备信息加载失败') }
+  devMgr.loading = false
+}
+
+async function unbindDevice(deviceId, clientType) {
+  if (!confirm(`确认解绑设备 …${deviceId.slice(-8)}（${clientType === 'web' ? '网页' : '插件'}席位）？该设备将立即下线，需重新登录。`)) return
+  devMgr.busy = true
+  try {
+    const r = await adminApi.post(`/cards/${devMgr.card.id}/devices/unbind`, { device_id: deviceId, client_type: clientType })
+    if (r.data.success) { toast.success('已解绑并下线该设备'); loadDevices() }
+    else toast.error(r.data.error || '解绑失败')
+  } catch (e) { toast.error(e.response?.data?.detail || '解绑失败') }
+  finally { devMgr.busy = false }
+}
+
+async function unbindAllDevices() {
+  if (!confirm('确认解绑全部设备并踢下线？用户需在各自设备重新登录（绑定关系清空，下次登录重新绑定）。')) return
+  devMgr.busy = true
+  try {
+    const r = await adminApi.post(`/cards/${devMgr.card.id}/devices/unbind-all`)
+    if (r.data.success) { toast.success(r.data.message || '已解绑全部设备'); loadDevices() }
+    else toast.error(r.data.error || '操作失败')
+  } catch (e) { toast.error(e.response?.data?.detail || '操作失败') }
+  finally { devMgr.busy = false }
+}
+
+async function kickSessions() {
+  if (!confirm('确认踢下线全部会话？设备绑定保留，用户在本机重新登录即可恢复。')) return
+  devMgr.busy = true
+  try {
+    const r = await adminApi.post(`/cards/${devMgr.card.id}/kick`)
+    if (r.data.success) { toast.success(r.data.message || '已踢下线'); loadDevices() }
+    else toast.error(r.data.error || '操作失败')
+  } catch (e) { toast.error(e.response?.data?.detail || '操作失败') }
+  finally { devMgr.busy = false }
 }
 
 async function delCard(id) {
@@ -179,6 +235,13 @@ onMounted(() => { load(); loadInterfaces() })
             <option value="local">仅本地下载</option>
           </select>
         </label>
+        <label>设备数
+          <select v-model.number="gen.max_devices">
+            <option :value="1">1 台（网页/插件各 1）</option>
+            <option :value="2">2 台</option>
+            <option :value="3">3 台</option>
+          </select>
+        </label>
         <button class="success" :disabled="gen.generating" @click="generate">{{ gen.generating ? '生成中…' : '生成' }}</button>
       </div>
       <div class="bind-row">
@@ -217,7 +280,7 @@ onMounted(() => { load(); loadInterfaces() })
       <div v-if="loading" class="empty-state">加载中…</div>
       <table v-else class="tbl">
         <thead>
-          <tr><th>卡密</th><th>状态</th><th>类型</th><th>到期/剩余</th><th>绑定接口</th><th>下载模式</th><th>备注</th><th>最近登录</th><th>操作</th></tr>
+          <tr><th>卡密</th><th>状态</th><th>类型</th><th>到期/剩余</th><th>绑定接口</th><th>下载模式</th><th>设备数</th><th>备注</th><th>最近登录</th><th>操作</th></tr>
         </thead>
         <tbody>
           <tr v-for="c in cards" :key="c.code">
@@ -230,16 +293,18 @@ onMounted(() => { load(); loadInterfaces() })
             </td>
             <td class="muted">{{ fmtBound(c) }}</td>
             <td class="muted">{{ fmtMode(c) }}</td>
+            <td class="muted">{{ c.max_devices || 1 }} 台</td>
             <td class="muted">{{ c.note || '—' }}</td>
             <td class="muted">{{ fmtDate(c.last_login_at) }}</td>
             <td class="ops">
               <a @click="renewCard(c)">续期</a>
               <a @click="openBindEditor(c)">绑定</a>
+              <a @click="openDeviceMgr(c)">设备</a>
               <a @click="toggleDisable(c)">{{ c.status==='disabled' ? '启用' : '禁用' }}</a>
               <a class="del" @click="delCard(c.id)">删除</a>
             </td>
           </tr>
-          <tr v-if="!cards.length"><td colspan="9" class="empty-state">暂无卡密</td></tr>
+          <tr v-if="!cards.length"><td colspan="10" class="empty-state">暂无卡密</td></tr>
         </tbody>
       </table>
       <div class="pager muted" v-if="total > pageSize">
@@ -269,9 +334,59 @@ onMounted(() => { load(); loadInterfaces() })
             <option value="local">仅本地下载</option>
           </select>
         </label>
+        <label class="bind-item block">
+          绑定设备数（每席位）
+          <select v-model.number="bindEditor.max_devices">
+            <option :value="1">1 台（默认，网页/插件各 1）</option>
+            <option :value="2">2 台</option>
+            <option :value="3">3 台</option>
+            <option :value="5">5 台</option>
+          </select>
+        </label>
         <div style="display:flex;gap:10px;margin-top:18px;justify-content:flex-end">
           <button class="ghost" @click="bindEditor.show=false">取消</button>
           <button class="success" :disabled="bindEditor.saving" @click="saveBinding">{{ bindEditor.saving ? '保存中…' : '保存' }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 设备绑定管理弹窗 -->
+    <div v-if="devMgr.show" class="modal-mask" @click.self="devMgr.show=false">
+      <div class="modal card-panel" style="width:560px">
+        <h3 style="margin:0 0 6px">💻 设备绑定</h3>
+        <p class="muted" style="margin:0 0 14px;font-size:13px">
+          卡密 <span class="mono">{{ devMgr.card?.code }}</span> ·
+          每席位上限 {{ devMgr.data?.max_devices ?? '—' }} 台 ·
+          在线会话 {{ devMgr.data?.active_sessions ?? 0 }} 个 ·
+          设备绑定：<b>{{ devMgr.data?.binding_enabled ? '已开启' : '未开启（系统配置中可开启）' }}</b>
+        </p>
+
+        <div v-if="devMgr.loading" class="empty-state">加载中…</div>
+        <template v-else>
+          <div v-for="(ct, key) in { web: '网页席位', extension: '插件席位' }" :key="key" style="margin-bottom:12px">
+            <div class="muted" style="font-size:12px;margin-bottom:4px">{{ ct }}</div>
+            <table v-if="devMgr.data?.devices?.[key]?.length" class="tbl">
+              <thead>
+                <tr><th>设备</th><th>绑定时间</th><th>最后活跃</th><th>最近 IP</th><th>操作</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="d in devMgr.data.devices[key]" :key="d.device_id">
+                  <td class="mono" :title="d.device_id">{{ d.device_tail }}</td>
+                  <td class="muted">{{ fmtDate(d.bound_at) }}</td>
+                  <td class="muted">{{ fmtDate(d.last_active_at) }}</td>
+                  <td class="muted mono">{{ d.last_ip || '—' }}</td>
+                  <td><a class="del" :disabled="devMgr.busy" @click="unbindDevice(d.device_id, key)">解绑</a></td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="muted" style="font-size:12px;padding:4px 0">（未绑定设备）</div>
+          </div>
+        </template>
+
+        <div style="display:flex;gap:10px;margin-top:14px;justify-content:flex-end">
+          <button class="ghost" :disabled="devMgr.busy" @click="kickSessions">踢下线全部会话</button>
+          <button class="ghost" :disabled="devMgr.busy" @click="unbindAllDevices">解绑全部设备</button>
+          <button class="success" @click="devMgr.show=false">关闭</button>
         </div>
       </div>
     </div>

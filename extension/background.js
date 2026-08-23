@@ -226,7 +226,34 @@ async function setQueue(q) {
 }
 
 // ── 旧 storage 工具（保留）──
-function cfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token'], r)) }
+function cfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token', 'deviceId'], r)) }
+// 设备绑定：所有带鉴权的请求统一附加 X-Device-Id（服务端开关关闭时忽略）
+async function authHeaders() {
+  const { token, deviceId } = await cfg()
+  if (!token) return null
+  const h = { Authorization: 'Bearer ' + token }
+  if (deviceId) h['X-Device-Id'] = deviceId
+  return h
+}
+
+// 401 统一处理：清本地登录态 + 记录原因（popup 打开时展示）+ 桌面通知。
+// 触发场景：被新设备顶号、管理员解绑/踢下线、会话空闲过期、风控强制下线。
+async function handleUnauthorized(reason) {
+  const o = await new Promise(r => chrome.storage.local.get(['token', 'serverUrl'], r))
+  if (!o.token) return
+  const msg = reason || '登录已失效，请重新登录'
+  await new Promise(r => chrome.storage.local.set({ token: null, card: null, auth_error: msg }, r))
+  try {
+    chrome.notifications.create('xm_auth_kicked', {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icon128.png'),
+      title: '登录已失效',
+      message: msg,
+      priority: 2,
+    }).catch(() => {})
+  } catch (e) {}
+  console.warn('[plugin] 登录失效：', msg)
+}
 function getSettings() { return new Promise(r => chrome.storage.local.get([STORAGE_SETTINGS], o => r({ ...DEFAULT_SETTINGS, ...(o[STORAGE_SETTINGS] || {}) }))) }
 function setSettings(s) { return new Promise(r => chrome.storage.local.set({ [STORAGE_SETTINGS]: s }, r)) }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
@@ -373,10 +400,12 @@ function handleMessage(msg, sender, sendResponse) {
 
 // ── 公告拉取 ──
 async function pollAnnouncement() {
-  const { serverUrl, token } = await cfg()
-  if (!serverUrl || !token) return null
+  const { serverUrl } = await cfg()
+  const headers = await authHeaders()
+  if (!serverUrl || !headers) return null
   try {
-    const r = await fetch(`${serverUrl}/api/announcements/current`, { headers: { Authorization: 'Bearer ' + token } })
+    const r = await fetch(`${serverUrl}/api/announcements/current`, { headers })
+    if (r.status === 401) { await handleUnauthorized((await r.json().catch(() => null))?.detail); return null }
     const data = await r.json()
     const ann = (data && data.success && data.announcement) ? data.announcement : null
     await new Promise(res => chrome.storage.local.set({ xm_announcement: ann }, res))
@@ -388,12 +417,18 @@ async function pollAnnouncement() {
 
 // ── 后端轮询 ──
 async function pollBackend() {
-  const { serverUrl, token } = await cfg()
-  if (!serverUrl || !token) return
+  const { serverUrl } = await cfg()
+  const headers = await authHeaders()
+  if (!serverUrl || !headers) return
   let newIds = []   // 真正新建的任务 id
   let ackIds = []   // 需要 ack 的任务 id（包含新建 + 重复去重后仍需 ack 的）
   try {
-    const r = await fetch(`${serverUrl}/api/extension/tasks`, { headers: { Authorization: 'Bearer ' + token } })
+    const r = await fetch(`${serverUrl}/api/extension/tasks`, { headers })
+    if (r.status === 401) {
+      // 被顶下线/解绑/过期/风控：清本地登录态并提示，停止本轮拉取
+      await handleUnauthorized((await r.json().catch(() => null))?.detail)
+      return
+    }
     const data = await r.json()
     if (!data.success) { console.warn('[plugin] poll backend failed', data); return }
     const tasks = data.tasks || []
@@ -455,7 +490,7 @@ async function pollBackend() {
     for (const tid of ackIds) {
       try {
         await fetch(`${serverUrl}/api/extension/tasks/${tid}/ack`, {
-          method: 'POST', headers: { Authorization: 'Bearer ' + token },
+          method: 'POST', headers,
         })
       } catch (e) { console.error('[plugin] ack failed', tid, e) }
     }
@@ -763,7 +798,7 @@ function resolveTerminal(downloadId) {
 }
 
 async function runTrack(taskId, trackId) {
-  const { serverUrl, token } = await cfg()
+  const { serverUrl, token, deviceId } = await cfg()
   let downloadId = null
   let lastErr = null
   const settings = await getSettings()
@@ -815,7 +850,7 @@ async function runTrack(taskId, trackId) {
       })
       if (shouldSkip) return
 
-      const url = await resolveForTrack(task, tr, { serverUrl, token })
+      const url = await resolveForTrack(task, tr, { serverUrl, token, deviceId })
       if (!url) throw new Error('解析结果为空')
       const fname = buildFilename(task, tr, settings.downloadPrefix)
       console.log('[plugin] start download', trackId, fname)
@@ -860,7 +895,7 @@ async function resolveForTrack(task, tr, ctx) {
   }
   const resolver = globalThis.RESOLVERS[task.source]
   if (!resolver) throw new Error(`未实现解析器: ${task.source}（本地下载要求 extension/sources/ 下有同名脚本注册该音源。若后端新增了脚本接口，需在 sources/ 放对应 JS 脚本、并在 sources.config.js 的 PLUGIN_SOURCES 登记；否则请改用网页端「服务器端下载」）`)
-  const res = await resolver(tr, { serverUrl: ctx.serverUrl, token: ctx.token, quality: task.quality, fmt: task.fmt, albumId: task.album_id })
+  const res = await resolver(tr, { serverUrl: ctx.serverUrl, token: ctx.token, deviceId: ctx.deviceId, quality: task.quality, fmt: task.fmt, albumId: task.album_id })
   return typeof res === 'string' ? res : (res.url || '')
 }
 
@@ -1218,10 +1253,12 @@ let xmCookieTs = 0
 async function getXmCookie() {
   const now = Date.now()
   if (xmCookieCache !== null && now - xmCookieTs < 5 * 60 * 1000) return xmCookieCache
-  const { serverUrl, token } = await cfg()
-  if (!serverUrl || !token) { xmCookieCache = []; xmCookieTs = now; return [] }
+  const { serverUrl } = await cfg()
+  const headers = await authHeaders()
+  if (!serverUrl || !headers) { xmCookieCache = []; xmCookieTs = now; return [] }
   try {
-    const r = await fetch(`${serverUrl}/api/extension/xm-cookie`, { headers: { Authorization: 'Bearer ' + token } })
+    const r = await fetch(`${serverUrl}/api/extension/xm-cookie`, { headers })
+    if (r.status === 401) { await handleUnauthorized((await r.json().catch(() => null))?.detail); xmCookieCache = []; xmCookieTs = now; return [] }
     const data = await r.json()
     xmCookieCache = Array.isArray(data.accounts) ? data.accounts : []
   } catch (e) {
@@ -1240,9 +1277,11 @@ function isRateLimited(msg) {
 async function markAccountCooldown(accountId, ctx) {
   if (!ctx || !ctx.serverUrl || !ctx.token || !accountId) return
   try {
+    const cdHeaders = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + ctx.token }
+    if (ctx.deviceId) cdHeaders['X-Device-Id'] = ctx.deviceId
     await fetch(`${ctx.serverUrl}/api/extension/xm-cookie/cooldown`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + ctx.token },
+      headers: cdHeaders,
       body: JSON.stringify({ account_id: accountId }),
     })
     // 冷却后立即失效本地缓存，下次 getXmCookie 会重新拉取可用账号
@@ -1334,10 +1373,16 @@ function notifyTaskDone(task) {
 
 // ── 连接状态 ──
 async function pingServer() {
-  const { serverUrl, token } = await cfg()
-  if (!serverUrl || !token) return { ok: false, msg: '未登录' }
+  const { serverUrl } = await cfg()
+  const headers = await authHeaders()
+  if (!serverUrl || !headers) return { ok: false, msg: '未登录' }
   try {
-    const r = await fetch(`${serverUrl}/api/extension/tasks`, { headers: { Authorization: 'Bearer ' + token } })
+    const r = await fetch(`${serverUrl}/api/extension/tasks`, { headers })
+    if (r.status === 401) {
+      const reason = (await r.json().catch(() => null))?.detail
+      await handleUnauthorized(reason)
+      return { ok: false, msg: reason || '登录已失效' }
+    }
     const data = await r.json()
     return { ok: !!data.success, msg: data.success ? '已连接' : (data.error || '服务器拒绝') }
   } catch (e) {

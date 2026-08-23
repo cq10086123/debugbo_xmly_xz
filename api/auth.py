@@ -97,6 +97,9 @@ class LoginRequest(BaseModel):
     code: str
     captchaId: str = ""
     captcha: str = ""
+    # ── 设备绑定（可选字段，向后兼容旧客户端；开关开启后必填 deviceId）──
+    deviceId: str = ""      # 客户端持久化的设备 ID（网页 localStorage / 插件 chrome.storage）
+    client: str = "web"     # 登录端类型：web=网页 | extension=插件（默认 web）
 
 
 @router.get("/captcha")
@@ -170,10 +173,31 @@ async def login(req: LoginRequest, request: Request):
             if card.expiry_type == "days" and card.activated_at is None:
                 card.activated_at = datetime.now(timezone.utc)
 
+        # ── 设备绑定：席位维护 + 顶号自动换绑（开关关闭时仅记录不限制）──
+        from core import device_binding as dvb
+        client_ip = ip
+        if dvb.device_binding_enabled():
+            client_type = dvb.normalize_client_type(req.client)
+            if not client_type:
+                raise HTTPException(status_code=400, detail="client 参数非法（仅支持 web / extension）")
+            device_id = (req.deviceId or "").strip()
+            if not device_id or len(device_id) > 64:
+                # 开关开启后必须携带设备 ID，否则删除该字段即可绕过绑定
+                raise HTTPException(
+                    status_code=403,
+                    detail="当前服务器已开启设备绑定，请更新网页（刷新页面）或插件到最新版本后重试",
+                )
+            dvb.bind_device_on_login(db, card, client_type, device_id, client_ip)
+        else:
+            # 开关关闭：不限制，但客户端带了 deviceId 就顺手记录（便于开启后无缝过渡）
+            client_type = dvb.normalize_client_type(req.client) or None
+            device_id = (req.deviceId or "").strip() or None
+
         # 生成新会话 token
         token = secrets.token_urlsafe(32)
         db.add(CardSession(token=token, card_id=card.id, is_active=True,
-                           last_active_at=datetime.now(timezone.utc)))
+                           last_active_at=datetime.now(timezone.utc),
+                           client_type=client_type, device_id=device_id, ip=client_ip))
         card.last_login_at = datetime.now(timezone.utc)
         db.commit()
 
