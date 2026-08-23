@@ -69,6 +69,17 @@ function withQueue(fn) {
   return p
 }
 
+// ── Cookie 注入互斥（官方源并发下载时防止 cookie 串号）──
+// MV3 禁止手动设置 Cookie 头，只能通过 chrome.cookies.set 写入全局 cookie 商店
+// 若两个官方 track 并发下载时交叉安装 cookie，会导致 A 用了 B 的账号
+// 用独立锁串行化官方解析的 cookie 安装 + fetch 阶段
+let cookieLock = Promise.resolve()
+function withCookieLock(fn) {
+  const p = cookieLock.then(fn, fn)
+  cookieLock = p.catch(() => {})
+  return p
+}
+
 // ── 新分片存储 API ──
 
 // 索引操作（⚠️ 这些函数不经过 withQueue 锁，调用方必须确保在锁内或无需锁保护）
@@ -379,7 +390,8 @@ async function pollAnnouncement() {
 async function pollBackend() {
   const { serverUrl, token } = await cfg()
   if (!serverUrl || !token) return
-  let newIds = []
+  let newIds = []   // 真正新建的任务 id
+  let ackIds = []   // 需要 ack 的任务 id（包含新建 + 重复去重后仍需 ack 的）
   try {
     const r = await fetch(`${serverUrl}/api/extension/tasks`, { headers: { Authorization: 'Bearer ' + token } })
     const data = await r.json()
@@ -395,7 +407,11 @@ async function pollBackend() {
       const idx = await getIndex()
       let changed = false
       for (const t of tasks) {
-        if (idx.some(existing => existing.task_id === t.task_id)) continue
+        if (idx.some(existing => existing.task_id === t.task_id)) {
+          // 已存在相同 task_id，仍需 ack 以防后端重复拉取
+          ackIds.push(t.task_id)
+          continue
+        }
 
         // 额外去重：同 album_id + 同 track_ids 已存在（running/pending/done）则跳过
         const newTrackIds = (t.tracks || []).map(x => String(x.track_id)).sort().join(',')
@@ -407,8 +423,7 @@ async function pollBackend() {
         })
         if (isDup) {
           console.log('[plugin] 跳过重复推送任务', t.album_id, t.task_id)
-          // 仍需 ack 后端，避免反复拉取
-          newIds.push(t.task_id) // 标记为已处理，触发 ack
+          ackIds.push(t.task_id)
           continue
         }
 
@@ -431,19 +446,21 @@ async function pollBackend() {
           createdAt: Date.now(),
         })
         newIds.push(t.task_id)
+        ackIds.push(t.task_id)
         changed = true
       }
       if (changed) await setIndex(idx)
     })
     // ack（已落库，丢 ack 也只是重复拉取，不会丢任务）
-    for (const t of tasks) {
+    for (const tid of ackIds) {
       try {
-        await fetch(`${serverUrl}/api/extension/tasks/${t.task_id}/ack`, {
+        await fetch(`${serverUrl}/api/extension/tasks/${tid}/ack`, {
           method: 'POST', headers: { Authorization: 'Bearer ' + token },
         })
-      } catch (e) { console.error('[plugin] ack failed', t.task_id, e) }
+      } catch (e) { console.error('[plugin] ack failed', tid, e) }
     }
-    console.log('[plugin] 已拉取新任务', newIds.length, '个')
+    if (newIds.length) console.log('[plugin] 已拉取新任务', newIds.length, '个')
+    if (ackIds.length !== newIds.length) console.log('[plugin] 已去重/已存在任务', ackIds.length - newIds.length, '个，已 ack')
   } catch (e) { console.error('[plugin] poll error', e); return }
 
   if (newIds.length) {
@@ -519,9 +536,11 @@ async function reconcileDownloads() {
   }
 
   // 阶段3：批量更新（短锁）+ 重建 inflight
+  // 注意：stage1 和 stage3 之间可能有 handleDownloadChanged 抢先更新了状态
+  // 因此这里要做防御性检查：若 track 已变为 done/error，则不再覆盖为 downloading/pending
   await withQueue(async () => {
     const idx = await getIndex()
-    const newInflight = new Set()
+    const newInflightFromSearch = new Set()
     let anyChanged = false
 
     for (const item of idx) {
@@ -532,9 +551,10 @@ async function reconcileDownloads() {
 
       for (const tr of task.tracks) {
         const key = task.task_id + '/' + tr.track_id
-        // 只处理快照中的 track
         const snap = snapshot.find(x => x.taskId === task.task_id && x.trackId === tr.track_id)
         if (!snap) continue
+
+        if (tr.status === 'done' || tr.status === 'error') continue
 
         if (snap.downloadId == null) {
           if (tr.status === 'downloading' || tr.status === 'resolving') {
@@ -553,8 +573,10 @@ async function reconcileDownloads() {
         } else if (it.state === 'complete') {
           if (tr.status !== 'done') { tr.status = 'done'; tr.error = ''; taskChanged = true }
         } else if (it.state === 'in_progress') {
-          if (tr.status !== 'downloading') { tr.status = 'downloading'; taskChanged = true }
-          newInflight.add(key)
+          if (tr.status === 'downloading' || tr.status === 'resolving' || tr.status === 'pending') {
+            if (tr.status !== 'downloading') { tr.status = 'downloading'; taskChanged = true }
+            newInflightFromSearch.add(key)
+          }
         }
       }
 
@@ -566,9 +588,23 @@ async function reconcileDownloads() {
       }
     }
 
-    // 重建 inflight：用新发现的仍在下载中的集合
+    // 重建 inflight：基于最终存储状态，包含所有仍为 downloading/resolving 的 track
+    // 避免丢失刚派发但不在快照中的任务，同时避免旧快照覆盖导致泄漏
+    const rebuilt = new Set()
+    for (const item of idx) {
+      if (item.status !== 'running' || item.paused) continue
+      const task = await getTask(item.task_id)
+      if (!task) continue
+      for (const tr of task.tracks) {
+        if (tr.status === 'downloading' || tr.status === 'resolving') {
+          rebuilt.add(task.task_id + '/' + tr.track_id)
+        }
+      }
+    }
+    for (const k of newInflightFromSearch) rebuilt.add(k)
+
     inflight.clear()
-    for (const k of newInflight) inflight.add(k)
+    for (const k of rebuilt) inflight.add(k)
 
     if (anyChanged) {
       await setIndex(idx)
@@ -668,7 +704,8 @@ async function pump() {
         .catch(e => console.error('[plugin] runTrack error', e))
         .finally(() => {
           inflight.delete(key)
-          pump()
+          // 用 setTimeout 避免同步递归导致调用栈过深，特别是在大量小文件快速完成时
+          setTimeout(() => pump(), 0)
         })
     }
   } finally {
@@ -803,8 +840,14 @@ async function runTrack(taskId, trackId) {
   ])
   if (!ok) {
     console.warn('[plugin] 下载超时', downloadId, trackId)
+    // 超时后清理 resolver，防止泄漏
+    trackDoneResolvers.delete(downloadId)
+    pendingTerminals.delete(downloadId)
     await updateTrack(taskId, trackId, { status: 'error', error: '下载超时（30分钟未完成）' })
     try { await chrome.downloads.cancel(downloadId) } catch (e) {}
+  } else {
+    // 正常完成，resolver 已在 resolveTerminal 中删除，此处防御性清理
+    trackDoneResolvers.delete(downloadId)
   }
 }
 
@@ -1241,30 +1284,34 @@ async function installXmCookies(cookieStr) {
 }
 
 async function resolveOfficialRotation(trackId, quality, sign, accounts, ctx) {
-  const usable = accounts.slice()
-  const errors = []
-  while (usable.length) {
-    const acc = usable.shift()
-    try {
-      await installXmCookies(acc.cookie)
-    } catch (e) {
-      const msg = (e && e.message) ? e.message : String(e)
-      console.warn('[plugin] 官方账号 cookie 注入失败，切换下一个:', acc.id, msg)
-      errors.push(`账号${acc.id}: cookie注入失败 ${msg}`)
-      continue
-    }
-    try {
-      return await globalThis.RESOLVERS.official(trackId, quality, sign)
-    } catch (e) {
-      const msg = (e && e.message) ? e.message : String(e)
-      errors.push(`账号${acc.id}: ${msg}`)
-      if (isRateLimited(msg)) {
-        console.warn('[plugin] 官方账号限流，切换下一个:', acc.id, msg)
-        await markAccountCooldown(acc.id, ctx)
+  // 用 cookie 锁串行化官方解析，防止并发下载时 cookie 串号
+  // 每个 track 的 cookie 安装 + fetch 原子化，避免 A 安装了账号1，B 紧接着安装账号2，A 的请求却用了账号2
+  return withCookieLock(async () => {
+    const usable = accounts.slice()
+    const errors = []
+    while (usable.length) {
+      const acc = usable.shift()
+      try {
+        await installXmCookies(acc.cookie)
+      } catch (e) {
+        const msg = (e && e.message) ? e.message : String(e)
+        console.warn('[plugin] 官方账号 cookie 注入失败，切换下一个:', acc.id, msg)
+        errors.push(`账号${acc.id}: cookie注入失败 ${msg}`)
+        continue
+      }
+      try {
+        return await globalThis.RESOLVERS.official(trackId, quality, sign)
+      } catch (e) {
+        const msg = (e && e.message) ? e.message : String(e)
+        errors.push(`账号${acc.id}: ${msg}`)
+        if (isRateLimited(msg)) {
+          console.warn('[plugin] 官方账号限流，切换下一个:', acc.id, msg)
+          await markAccountCooldown(acc.id, ctx)
+        }
       }
     }
-  }
-  throw new Error(errors.length ? errors.join(' | ') : '所有官方账号均不可用')
+    throw new Error(errors.length ? errors.join(' | ') : '所有官方账号均不可用')
+  })
 }
 
 // ── 完成通知 ──
