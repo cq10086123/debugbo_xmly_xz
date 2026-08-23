@@ -1,0 +1,17 @@
+services:
+  ximalaya-webui:
+    image: 192.168.100.105:6551/cq10086123/ximalaya-webui:latest
+    build: .
+    container_name: ximalaya-webui
+    restart: unless-stopped
+    ports:
+      - "6500:6500"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - DATA_DIR=/app/data
+      - DOWNLOAD_DIR=/app/downloads
+    shm_size: "2g"
+    privileged: true

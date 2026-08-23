@@ -1,0 +1,22 @@
+{
+  "name": "yousheng-xiazai-frontend",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "echo [已禁用] 本地验证只用6500端口(npm run build后由后端app.py托管dist), 不要起5173的vite-dev. 需要本地热更新开发前端请显式运行: npm run dev:local",
+    "dev:local": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "pinia": "^2.2.4",
+    "vue": "^3.5.12",
+    "vue-router": "^4.4.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.1.4",
+    "vite": "^5.4.10"
+  }
+}

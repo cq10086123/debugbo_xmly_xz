@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 运行时数据
+downloads/
+data/
+config.json
+cookie.txt
+*.log
+
+# 其他
+.workbuddy/
+.browser_id
+.DS_Store
+Thumbs.db
+
+# 环境变量配置
+.env
+
+# 本地数据库（含真实管理员密码哈希/卡密/下载记录，禁止入库）
+app.db*
+
+# 前端依赖（体积巨大，构建时由 Docker 重新安装）
+frontend/node_modules/
+
+# 旧代码归档（历史备份，非运行所需）
+archive/

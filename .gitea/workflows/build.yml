@@ -1,0 +1,23 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        run: git clone --depth 1 http://192.168.100.105:6551/cq10086123/ximalaya_xz.git /tmp/build && cd /tmp/build && git checkout $GITEA_SHA
+
+      - name: Login and Build
+        run: |
+          cd /tmp/build
+          echo "qazxsw123" | docker login 192.168.100.105:6551 -u cq10086123 --password-stdin
+          docker build -t 192.168.100.105:6551/cq10086123/ximalaya-webui:latest .
+          docker push 192.168.100.105:6551/cq10086123/ximalaya-webui:latest
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/build

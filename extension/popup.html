@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<style>
+  body { width: 400px; font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif; padding: 14px; box-sizing: border-box; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  label { display: block; font-size: 12px; color: #555; margin: 8px 0 3px; }
+  input[type=text], input[type=password], input[type=number] { width: 100%; box-sizing: border-box; padding: 7px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
+  button { margin-top: 10px; width: 100%; padding: 8px; border: 1px solid #2b7de9; border-radius: 6px; background: #2b7de9; color: #fff; font-size: 13px; cursor: pointer; transition: .15s; }
+  button:hover { background: #1a6fd6; }
+  button.alt { background: #fff; color: #2b7de9; }
+  button.alt:hover { background: #2b7de9; color: #fff; }
+  button:disabled { opacity: .55; cursor: not-allowed; background: #eef2f7; color: #888; border-color: #ccd6e3; }
+  .status { font-size: 12px; margin-top: 8px; line-height: 1.5; }
+  .ok { color: #1a9d4b; } .err { color: #d23333; }
+  .task { border: 1px solid #eee; border-radius: 8px; padding: 10px; margin-top: 10px; font-size: 12px; }
+  .task b { font-size: 13px; }
+  .muted { color: #888; }
+  .progress-bar { height: 6px; background: #eef2f7; border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .progress-fill { height: 100%; background: #2b7de9; width: 0%; transition: width .3s; }
+  .tracks { margin-top: 8px; max-height: 220px; overflow-y: auto; }
+  .tr { display: flex; align-items: center; gap: 6px; padding: 3px 0; border-bottom: 1px solid #f5f5f5; }
+  .tr .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .dot.pending { background: #aaa; }
+  .dot.downloading { background: #2b7de9; }
+  .dot.done { background: #1a9d4b; }
+  .dot.error { background: #d23333; }
+  .tr .tt { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tr .err { flex-shrink: 0; color: #d23333; font-size: 11px; }
+  .tr .bytes { flex-shrink: 0; color: #2b7de9; font-size: 11px; }
+  .hint { font-size: 11px; color: #888; margin-top: 4px; }
+  hr { border: 0; border-top: 1px solid #eee; margin: 12px 0; }
+
+  /* 验证码 */
+  .captcha-row { display: flex; gap: 8px; align-items: stretch; }
+  .captcha-row input[type=text] { flex: 1; }
+  .captcha-img { height: 36px; min-width: 96px; border: 1px solid #ccc; border-radius: 6px; cursor: pointer; background: #f3f5f9; object-fit: contain; }
+  .captcha-img:active { transform: scale(.97); }
+
+  /* 设置区 */
+  .checkrow { margin: 6px 0; }
+  .checkrow label { display: flex; align-items: center; gap: 6px; margin: 0; cursor: pointer; }
+  .checkrow input[type=checkbox] { width: auto; margin: 0; }
+
+  /* 任务操作 */
+  .actions { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .mini { width: auto; margin: 0; padding: 5px 10px; font-size: 12px; border-radius: 6px; background: #eef2f7; color: #333; border-color: #dde5ee; }
+  .mini:hover { background: #dde5ee; }
+  .mini.danger { background: #fde8e8; color: #d23333; border-color: #f5c6c6; }
+  .mini.danger:hover { background: #f9d5d5; }
+  .task-head { display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; }
+
+  /* 按钮行 */
+  .btnrow { display: flex; gap: 8px; }
+  .btnrow button { flex: 1; }
+
+  /* 汇总行 */
+  #summary { font-size: 12px; color: #555; margin-top: 12px; font-weight: 600; }
+  #summary:empty { display: none; }
+
+  /* 连接状态 */
+  .conn { font-size: 12px; font-weight: 600; }
+  .conn.ok { color: #1a9d4b; }
+  .conn.err { color: #d23333; }
+  #who { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+
+  /* 公告横幅 */
+  .ann-box { border: 1px solid #f4c56a; background: #fff8e6; border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12px; }
+  .ann-head { display: flex; justify-content: space-between; align-items: center; }
+  .ann-badge { font-size: 11px; font-weight: 700; color: #b8860b; background: #fdeec9; border: 1px solid #f4c56a; padding: 2px 8px; border-radius: 999px; }
+  .ann-close { cursor: pointer; color: #b8860b; font-size: 14px; padding: 0 4px; user-select: none; }
+  .ann-close:hover { color: #8a6508; }
+  .ann-title { font-weight: 700; font-size: 13px; margin: 8px 0 4px; color: #333; }
+  .ann-content { color: #444; line-height: 1.6; white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow-y: auto; }
+  .ann-box button { margin-top: 10px; }
+</style>
+</head>
+<body>
+  <h2>🌐 有声下载·本地插件</h2>
+  <div id="loginBox">
+    <label id="serverLabel">服务器地址（含端口）</label>
+    <input id="server" type="text" placeholder="http://你的服务器IP:6500" />
+    <label>卡密</label>
+    <input id="code" type="password" placeholder="请输入卡密" />
+    <label>验证码</label>
+    <div class="captcha-row">
+      <input id="captcha" type="text" placeholder="请输入验证码" maxlength="4" autocomplete="off" />
+      <img id="captchaImg" class="captcha-img" title="点击刷新验证码" alt="验证码" />
+    </div>
+    <button id="loginBtn">登录</button>
+  </div>
+  <div id="mainBox" style="display:none">
+    <div class="status" id="who"></div>
+    <div><span class="conn" id="conn">● 连接中…</span></div>
+    <div id="announcementBox" class="ann-box" style="display:none">
+      <div class="ann-head"><span class="ann-badge">📢 公告</span><span class="ann-close" id="annClose" title="关闭">✕</span></div>
+      <div class="ann-title" id="annTitle"></div>
+      <div class="ann-content" id="annContent"></div>
+      <button id="annAck" class="alt">知道了</button>
+    </div>
+    <hr />
+    <label>下载目录前缀（放在 Chrome 默认下载目录下）</label>
+    <input id="downloadPrefix" type="text" placeholder="有声下载" />
+    <div class="hint">例如填「有声下载」→ 文件会存到「下载/有声下载/专辑名/0001 标题.mp3」</div>
+    <label>同时下载数量（1-8）</label>
+    <input id="concurrency" type="number" min="1" max="8" step="1" value="1" />
+    <div class="hint">仅作用于同一本书内的集；多本书永远自动排队、逐本下载，不会同时下多本</div>
+    <label>每集下载间隔延迟（毫秒，0 = 不延迟）</label>
+    <input id="downloadDelay" type="number" min="0" max="120000" step="100" value="500" />
+    <div class="hint">例如填 2000 → 每集开始前等 2 秒，缓解音源风控</div>
+    <label>失败自动重试次数（解析/创建下载失败时）</label>
+    <input id="maxRetry" type="number" min="1" max="10" step="1" value="3" />
+    <div class="checkrow"><label><input id="autoDownload" type="checkbox" checked /> 新任务自动开始下载（无需手动点）</label></div>
+    <div class="checkrow"><label><input id="silentDownload" type="checkbox" checked /> 静默下载（不弹浏览器下载提示）</label></div>
+    <button id="saveSettingsBtn" class="alt">保存设置</button>
+    <hr />
+    <button id="refreshBtn" class="alt">🔄 拉取待下载任务</button>
+    <button id="dlBtn">⬇️ 立即下载全部待处理</button>
+    <div class="btnrow">
+      <button id="pauseAllBtn" class="alt">⏸ 全部暂停</button>
+      <button id="resumeAllBtn" class="alt">▶ 全部继续</button>
+    </div>
+    <button id="retryAllBtn" class="alt">↻ 重试全部失败项</button>
+    <div class="btnrow">
+      <button id="clearBtn" class="alt">🧹 清空已完成</button>
+      <button id="clearEndedBtn" class="alt">🗑 清空已结束</button>
+    </div>
+    <button id="logoutBtn" class="alt">退出登录</button>
+    <div id="summary"></div>
+    <div id="tasks"></div>
+  </div>
+  <div class="status" id="msg"></div>
+  <script src="config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
