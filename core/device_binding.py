@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from db.session import SessionLocal
-from db.models import Card, Session as CardSession, DeviceBinding, ApiConfig
+from db.models import Session as CardSession, DeviceBinding, ApiConfig
 from db.init_db import log_card_event
 
 # ── 常量与默认值 ──
@@ -299,47 +299,54 @@ def trim_bindings_to_limit(db, card) -> int:
 
 
 def unbind_device(db, card, device_id: str, client_type: str | None = None) -> int:
-    """解绑设备（删除绑定 + 失效其会话）。client_type 为空表示两个席位都查。返回解绑数。"""
-    q = db.query(DeviceBinding).filter_by(card_id=card.id, device_id=device_id)
-    if client_type:
-        q = q.filter_by(client_type=client_type)
-    rows = q.all()
-    n = 0
-    for row in rows:
-        deactivate_device_sessions(db, card.id, row.client_type, row.device_id)
-        db.delete(row)
-        n += 1
-    if n:
-        label = CLIENT_LABELS.get(client_type, "全部") if client_type else "全部"
-        log_card_event(
-            "device_unbind", card.id,
-            f"卡密 {card.code} 管理员解绑设备 …{device_id[-8:]}（{label}席位，含会话清理）"
-        )
-    return n
+    """解绑设备（删除绑定 + 失效其会话）。client_type 为空表示两个席位都查。返回解绑数。
+
+    持 _BIND_LOCK：与并发登录的「查席位→淘汰→插入」互斥，避免交叠窗口内
+    登录侧基于旧绑定快照写入、解绑结果被部分覆盖。
+    """
+    with _BIND_LOCK:
+        q = db.query(DeviceBinding).filter_by(card_id=card.id, device_id=device_id)
+        if client_type:
+            q = q.filter_by(client_type=client_type)
+        rows = q.all()
+        n = 0
+        for row in rows:
+            deactivate_device_sessions(db, card.id, row.client_type, row.device_id)
+            db.delete(row)
+            n += 1
+        if n:
+            label = CLIENT_LABELS.get(client_type, "全部") if client_type else "全部"
+            log_card_event(
+                "device_unbind", card.id,
+                f"卡密 {card.code} 管理员解绑设备 …{device_id[-8:]}（{label}席位，含会话清理）"
+            )
+        return n
 
 
 def unbind_all(db, card) -> int:
     """解绑该卡密全部设备并踢下线全部会话。返回解绑设备数。"""
-    rows = db.query(DeviceBinding).filter_by(card_id=card.id).all()
-    for row in rows:
-        deactivate_device_sessions(db, card.id, row.client_type, row.device_id)
-        db.delete(row)
-    # 兜底：清掉所有活跃会话（含历史无设备会话）
-    for s in db.query(CardSession).filter_by(card_id=card.id, is_active=True).all():
-        s.is_active = False
-    if rows:
-        log_card_event("device_unbind", card.id, f"卡密 {card.code} 管理员解绑全部设备（{len(rows)} 台）并踢下线")
-    return len(rows)
+    with _BIND_LOCK:
+        rows = db.query(DeviceBinding).filter_by(card_id=card.id).all()
+        for row in rows:
+            deactivate_device_sessions(db, card.id, row.client_type, row.device_id)
+            db.delete(row)
+        # 兜底：清掉所有活跃会话（含历史无设备会话）
+        for s in db.query(CardSession).filter_by(card_id=card.id, is_active=True).all():
+            s.is_active = False
+        if rows:
+            log_card_event("device_unbind", card.id, f"卡密 {card.code} 管理员解绑全部设备（{len(rows)} 台）并踢下线")
+        return len(rows)
 
 
 def kick_all_sessions(db, card) -> int:
     """仅踢下线（保留绑定关系）：用户下次在本机重新登录即可，不占换绑语义。"""
-    rows = db.query(CardSession).filter_by(card_id=card.id, is_active=True).all()
-    for s in rows:
-        s.is_active = False
-    if rows:
-        log_card_event("device_kick", card.id, f"卡密 {card.code} 管理员踢下线全部会话（{len(rows)} 条）")
-    return len(rows)
+    with _BIND_LOCK:
+        rows = db.query(CardSession).filter_by(card_id=card.id, is_active=True).all()
+        for s in rows:
+            s.is_active = False
+        if rows:
+            log_card_event("device_kick", card.id, f"卡密 {card.code} 管理员踢下线全部会话（{len(rows)} 条）")
+        return len(rows)
 
 
 # ════════════════════════════════════════

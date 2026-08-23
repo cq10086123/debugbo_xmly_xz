@@ -10,7 +10,7 @@ function setMsg(text, cls) {
   el.textContent = text || ''
   el.className = 'status ' + (cls || '')
 }
-function getCfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token', 'card', 'deviceId'], r)) }
+function getCfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token', 'card', 'deviceId', 'auth_error'], r)) }
 function setCfg(obj) { return new Promise(r => chrome.storage.local.set(obj, r)) }
 
 // ── 设备 ID（设备绑定用）：首次生成后持久化，退出登录不清除 ──
