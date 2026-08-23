@@ -10,11 +10,21 @@
 - 总开关 api_config.device_binding_enabled（默认关闭）：关闭时登录不要求
   deviceId、鉴权跳过设备校验 → 行为与历史版本完全一致，等价于一键回退。
 
+绑定粒度（device_binding_scope，默认 ip）：
+- ip（宽松，默认）：按「出口网络」绑定 —— 同一公网 IP（网段归一：IPv4 /24、
+  IPv6 /48、局域网统一记 "lan"）下不限设备/浏览器数量；只有换到另一个
+  公网 IP（另一个家庭/网络）登录才算换设备、触发顶号换绑。
+- device（严格，旧行为）：按浏览器持久化 deviceId 绑定，同一台电脑的
+  不同浏览器也算不同设备。
+
 兼容策略：
 - 存量 sessions 行 device_id 为 NULL（升级部署前已登录的用户）→ 校验放行，
   下次登录起才写入绑定（平滑过渡，不暴力踢出在线用户）。
+- 切换 scope 不误踢：ip 模式遇到 device 模式产生的会话（反之亦然）一律
+  放行，等用户下次登录时自然换轨到新粒度。
 """
 
+import ipaddress
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -31,6 +41,15 @@ VALID_CLIENT_TYPES = (CLIENT_WEB, CLIENT_EXTENSION)
 DEFAULT_MAX_DEVICES = 1
 MAX_DEVICES_LIMIT = 10          # 管理端可设置的上限，防误填
 DEFAULT_SESSION_IDLE_DAYS = 7   # 会话空闲过期天数（可配 session_idle_days）
+
+# 绑定粒度
+SCOPE_IP = "ip"                 # 宽松：按出口网络绑定（同 IP 不限设备）
+SCOPE_DEVICE = "device"         # 严格：按浏览器 deviceId 绑定（旧行为）
+VALID_SCOPES = (SCOPE_IP, SCOPE_DEVICE)
+DEFAULT_SCOPE = SCOPE_IP
+
+# 局域网/私网来源统一归一为该键（直连内网部署时同一户内所有机器视作同一网络）
+LAN_SCOPE_KEY = "lan"
 
 # 客户端展示名（管理端/日志用）
 CLIENT_LABELS = {CLIENT_WEB: "网页", CLIENT_EXTENSION: "插件"}
@@ -89,6 +108,100 @@ def session_idle_days() -> int:
     except (TypeError, ValueError):
         return DEFAULT_SESSION_IDLE_DAYS
     return v if 1 <= v <= 365 else DEFAULT_SESSION_IDLE_DAYS
+
+
+def binding_scope() -> str:
+    """绑定粒度：api_config.device_binding_scope（ip=宽松按网络 / device=严格按浏览器）。
+
+    默认 ip（宽松）；非法值回退默认。
+    """
+    raw = str(_load_cfg_cached().get("device_binding_scope", DEFAULT_SCOPE) or "").strip().lower()
+    return raw if raw in VALID_SCOPES else DEFAULT_SCOPE
+
+
+def trust_proxy_header() -> bool:
+    """是否信任反向代理传递的 X-Forwarded-For / X-Real-IP（api_config.trust_proxy_header，默认关）。
+
+    仅当服务部署在可信反向代理（nginx 等）之后才应开启，否则攻击者可伪造头
+    绕过按 IP 的绑定/限流。直连部署保持关闭（默认）。
+    """
+    return _truthy(_load_cfg_cached().get("trust_proxy_header", "0"))
+
+
+def resolve_client_ip(request) -> str | None:
+    """解析客户端真实 IP：
+
+    - trust_proxy_header 开启：优先 X-Forwarded-For 首个合法 IP，再看 X-Real-IP；
+    - 否则/解析失败：回退 request.client.host（直连语义）。
+    scope=ip 绑定、登录限流、风控均应经此取 IP，保证反代部署下语义正确。
+    """
+    direct = request.client.host if request is not None and request.client else None
+    if request is None or not trust_proxy_header():
+        return direct
+    try:
+        xff = request.headers.get("x-forwarded-for") or ""
+        for part in xff.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            try:
+                ipaddress.ip_address(p)
+                return p
+            except ValueError:
+                continue   # 非法段跳过，继续找下一个/回退 X-Real-IP
+        xri = (request.headers.get("x-real-ip") or "").strip()
+        if xri:
+            try:
+                ipaddress.ip_address(xri)
+                return xri
+            except ValueError:
+                pass
+    except Exception:
+        pass
+    return direct
+
+
+# ════════════════════════════════════════
+#  IP → 网络键归一化（scope=ip 的绑定标识）
+# ════════════════════════════════════════
+def ip_scope_key(ip: str | None) -> str | None:
+    """把客户端 IP 归一化为「网络键」，作为 scope=ip 模式下的绑定标识：
+
+    - 私网/回环/链路本地（直连内网部署、同一户内网）→ 统一 "lan"
+    - IPv4 → /24 网段（家庭宽带重拨/同城跳变通常落在同网段，避免误踢）
+    - IPv6 → /48 网段（ISP 给家庭分配 /48~/56，接口后缀会轮换）
+    - 解析失败/为空 → None（调用方 fail-open 或回退 deviceId）
+    """
+    if not ip:
+        return None
+    try:
+        addr = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return None
+    if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified:
+        return LAN_SCOPE_KEY
+    if addr.version == 4:
+        return str(ipaddress.ip_network(f"{addr}/24", strict=False))
+    return str(ipaddress.ip_network(f"{addr}/48", strict=False))
+
+
+def is_ip_scope_key(v: str | None) -> bool:
+    """判断存量绑定/会话里的标识是否是 ip 模式产生的网络键（用于双向平滑切换）。
+
+    网络键形如 "1.2.3.0/24"、"2001:db8::/48" 或 "lan"；浏览器 deviceId 不含 "/"。
+    """
+    if not v:
+        return False
+    return v == LAN_SCOPE_KEY or "/" in v
+
+
+def login_identity(device_id: str | None, client_ip: str | None) -> str | None:
+    """登录时计算绑定标识：scope=ip 用网络键（拿不到 IP 时回退 deviceId），
+    scope=device 用浏览器 deviceId。返回 None 表示无法确定标识。
+    """
+    if binding_scope() == SCOPE_IP:
+        return ip_scope_key(client_ip) or ((device_id or "").strip() or None)
+    return (device_id or "").strip() or None
 
 
 # ════════════════════════════════════════
@@ -157,6 +270,50 @@ def check_session_pure(
     return True, "", ""
 
 
+def check_session_ip_pure(
+    sess_net_key: str | None,
+    sess_client_type: str | None,
+    sess_last_active: datetime | None,
+    request_net_key: str | None,
+    bound_net_keys: set[str],
+    idle_days: int,
+    now: datetime | None = None,
+) -> tuple[bool, str, str]:
+    """scope=ip 模式的会话校验（纯函数）：只看「出口网络」，不看浏览器。
+
+    返回 (ok, code, message)：
+    - ok=True                放行（同网络下不限设备/浏览器数量）
+    - code=network_changed   出口网络与登录时不同（换了家庭/网络）→ 重新登录即换绑
+    - code=kicked            所属网络的绑定已被顶号换绑 / 解绑
+    - code=session_expired   会话空闲超时
+    宽松原则：
+    - sess_net_key 为空（历史/免设备会话）→ 放行
+    - sess_net_key 不是网络键（device 模式遗留会话）→ 放行（下次登录换轨）
+    - request_net_key 为空（拿不到客户端 IP）→ 不作为踢出证据，放行
+    """
+    if not sess_net_key:
+        return True, "", ""
+    if not is_ip_scope_key(sess_net_key):
+        return True, "", ""  # device 模式产生的会话：切换 scope 不误踢
+
+    now = now or datetime.now(timezone.utc)
+
+    # 1) 出口网络必须与登录时一致（换 IP = 换设备语义）
+    if request_net_key is not None and request_net_key != sess_net_key:
+        return False, "network_changed", "网络环境已变更，请重新登录"
+
+    # 2) 会话所属网络必须仍在绑定席位内（防已被顶号/解绑的旧网络继续用）
+    if sess_client_type and sess_net_key not in bound_net_keys:
+        return False, "kicked", "账号已在其他网络登录，本设备已下线"
+
+    # 3) 空闲过期
+    last = _aware(sess_last_active)
+    if last is not None and (now - last) > timedelta(days=idle_days):
+        return False, "session_expired", "登录已过期（长期未使用），请重新登录"
+
+    return True, "", ""
+
+
 # ════════════════════════════════════════
 #  绑定维护（登录 / 解绑 / 踢线，需要 db 会话）
 # ════════════════════════════════════════
@@ -168,6 +325,13 @@ def bound_device_ids(db, card_id: int, client_type: str) -> set[str]:
         .all()
     )
     return {r.device_id for r in rows}
+
+
+def _id_label(v: str | None) -> str:
+    """绑定标识的展示形式：网络键（scope=ip）整串展示，浏览器 deviceId 只展示尾部。"""
+    if not v:
+        return ""
+    return f"网络 {v}" if is_ip_scope_key(v) else f"…{v[-8:]}"
 
 
 # 绑定维护互斥锁：登录的「查席位 → 淘汰 → 插入」是非原子序列，并发登录同一卡密
@@ -241,12 +405,12 @@ def _bind_device_on_login_locked(db, card, client_type: str, device_id: str, ip:
         log_card_event(
             "device_kick", card.id,
             f"卡密 {card.code} [{CLIENT_LABELS.get(client_type, client_type)}席位] 顶号换绑："
-            f"新设备 …{device_id[-8:]} 踢掉设备 …{', …'.join(e[-8:] for e in evicted)}（失效会话 {kicked_sessions} 条）"
+            f"新登录 {_id_label(device_id)} 踢掉 {', '.join(_id_label(e) for e in evicted)}（失效会话 {kicked_sessions} 条）"
         )
     else:
         log_card_event(
             "device_bind", card.id,
-            f"卡密 {card.code} [{CLIENT_LABELS.get(client_type, client_type)}席位] 绑定设备 …{device_id[-8:]}"
+            f"卡密 {card.code} [{CLIENT_LABELS.get(client_type, client_type)}席位] 绑定 {_id_label(device_id)}"
             + (f"（IP {ip}）" if ip else "")
         )
 
@@ -318,7 +482,7 @@ def unbind_device(db, card, device_id: str, client_type: str | None = None) -> i
             label = CLIENT_LABELS.get(client_type, "全部") if client_type else "全部"
             log_card_event(
                 "device_unbind", card.id,
-                f"卡密 {card.code} 管理员解绑设备 …{device_id[-8:]}（{label}席位，含会话清理）"
+                f"卡密 {card.code} 管理员解绑 {_id_label(device_id)}（{label}席位，含会话清理）"
             )
         return n
 
@@ -352,11 +516,29 @@ def kick_all_sessions(db, card) -> int:
 # ════════════════════════════════════════
 #  鉴权入口（api/deps.py 唯一调用点）
 # ════════════════════════════════════════
-def check_session(db, sess: CardSession, request_device_id: str | None) -> tuple[bool, str, str]:
-    """总开关下的会话设备校验（开关关闭 → 直接放行）。"""
+def check_session(db, sess: CardSession, request_device_id: str | None,
+                  client_ip: str | None = None) -> tuple[bool, str, str]:
+    """总开关下的会话设备校验（开关关闭 → 直接放行），按 scope 分流：
+
+    - scope=ip（宽松）：只比对出口网络键，同一 IP 下不限设备/浏览器；
+    - scope=device（严格）：比对浏览器 deviceId（旧行为）。
+    切换 scope 时对另一模式产生的存量会话放行（平滑过渡，不误踢）。
+    """
     if not device_binding_enabled():
         return True, "", ""
     bound = bound_device_ids(db, sess.card_id, sess.client_type) if sess.client_type else set()
+    if binding_scope() == SCOPE_IP:
+        return check_session_ip_pure(
+            sess.device_id,
+            sess.client_type,
+            sess.last_active_at,
+            ip_scope_key(client_ip),
+            bound,
+            session_idle_days(),
+        )
+    # scope=device：ip 模式遗留会话（device_id 是网络键）放行，避免切换时误踢
+    if is_ip_scope_key(sess.device_id):
+        return True, "", ""
     return check_session_pure(
         sess.device_id,
         sess.client_type,
@@ -382,7 +564,9 @@ def device_binding_status(card) -> dict:
             out[ct] = [
                 {
                     "device_id": r.device_id,
-                    "device_tail": ("…" + r.device_id[-8:]) if r.device_id else "",
+                    "device_tail": (r.device_id if is_ip_scope_key(r.device_id)
+                                    else ("…" + r.device_id[-8:])) if r.device_id else "",
+                    "is_network": is_ip_scope_key(r.device_id),
                     "client_type": r.client_type,
                     "client_label": CLIENT_LABELS.get(r.client_type, r.client_type),
                     "bound_at": r.bound_at.isoformat() if r.bound_at else None,

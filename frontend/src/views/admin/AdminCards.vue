@@ -145,7 +145,8 @@ async function loadDevices() {
 }
 
 async function unbindDevice(deviceId, clientType) {
-  if (!confirm(`确认解绑设备 …${deviceId.slice(-8)}（${clientType === 'web' ? '网页' : '插件'}席位）？该设备将立即下线，需重新登录。`)) return
+  const label = deviceId.includes('/') || deviceId === 'lan' ? `网络 ${deviceId}` : `设备 …${deviceId.slice(-8)}`
+  if (!confirm(`确认解绑${label}（${clientType === 'web' ? '网页' : '插件'}席位）？该${deviceId.includes('/') || deviceId === 'lan' ? '网络下的会话' : '设备'}将立即下线，需重新登录。`)) return
   devMgr.busy = true
   try {
     const r = await adminApi.post(`/cards/${devMgr.card.id}/devices/unbind`, { device_id: deviceId, client_type: clientType })
@@ -353,7 +354,7 @@ onMounted(() => { load(); loadInterfaces() })
           卡密 <span class="mono">{{ devMgr.card?.code }}</span> ·
           每席位上限 {{ devMgr.data?.max_devices ?? '—' }} 台 ·
           在线会话 {{ devMgr.data?.active_sessions ?? 0 }} 个 ·
-          设备绑定：<b>{{ devMgr.data?.binding_enabled ? '已开启' : '未开启（系统配置中可开启）' }}</b>
+          设备绑定：<b>{{ devMgr.data?.binding_enabled ? (devMgr.data?.binding_scope === 'ip' ? '已开启（按网络IP，同IP不限设备）' : '已开启（按浏览器设备）') : '未开启（系统配置中可开启）' }}</b>
         </p>
 
         <div v-if="devMgr.loading" class="empty-state">加载中…</div>
@@ -362,7 +363,7 @@ onMounted(() => { load(); loadInterfaces() })
             <div class="muted" style="font-size:12px;margin-bottom:4px">{{ ct }}</div>
             <table v-if="devMgr.data?.devices?.[key]?.length" class="tbl">
               <thead>
-                <tr><th>设备</th><th>绑定时间</th><th>最后活跃</th><th>最近 IP</th><th>操作</th></tr>
+                <tr><th>设备 / 网络</th><th>绑定时间</th><th>最后活跃</th><th>最近 IP</th><th>操作</th></tr>
               </thead>
               <tbody>
                 <tr v-for="d in devMgr.data.devices[key]" :key="d.device_id">

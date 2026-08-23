@@ -285,6 +285,170 @@ def test_risk_record_token_ip():
     rc.forget_token("tok-risk")
 
 
+def test_ip_scope_key():
+    """IP → 网络键归一化：私网→lan、v4 /24、v6 /48。"""
+    assert dvb.ip_scope_key(None) is None
+    assert dvb.ip_scope_key("") is None
+    assert dvb.ip_scope_key("not-an-ip") is None
+    assert dvb.ip_scope_key("unknown") is None
+    assert dvb.ip_scope_key("192.168.1.10") == "lan"        # 私网/内网部署 → 同一网络
+    assert dvb.ip_scope_key("127.0.0.1") == "lan"
+    assert dvb.ip_scope_key("10.0.0.5") == "lan"
+    assert dvb.ip_scope_key("1.2.3.4") == dvb.ip_scope_key("1.2.3.99")   # 同 /24 → 同网络
+    assert dvb.ip_scope_key("1.2.3.4") != dvb.ip_scope_key("1.2.4.4")    # 不同 /24 → 换了网络
+    v6a = "2606:4700:aaaa:bbbb:cccc:dddd:eeee:1111"
+    v6b = "2606:4700:aaaa:ffff::2222"                        # 同 /48（后缀轮换不误踢）
+    v6c = "2606:4700:bbbb:aaaa::2222"                        # 不同 /48
+    assert dvb.ip_scope_key(v6a) == dvb.ip_scope_key(v6b)
+    assert dvb.ip_scope_key(v6a) != dvb.ip_scope_key(v6c)
+
+
+def test_is_ip_scope_key():
+    """网络键与浏览器 deviceId 的判别（双向平滑切换的依据）。"""
+    assert dvb.is_ip_scope_key("lan")
+    assert dvb.is_ip_scope_key("1.2.3.0/24")
+    assert dvb.is_ip_scope_key("2606:4700:aaaa::/48")
+    assert not dvb.is_ip_scope_key("a1b2c3d4-browser-uuid")
+    assert not dvb.is_ip_scope_key("")
+    assert not dvb.is_ip_scope_key(None)
+
+
+def test_check_session_ip_pure():
+    """scope=ip 宽松校验：同网络不限设备，换网络才踢。"""
+    now = datetime.now(timezone.utc)
+    net = "1.2.3.0/24"
+
+    # 历史/免设备会话 → 放行
+    ok, code, _ = dvb.check_session_ip_pure(None, "web", now, net, set(), 7, now)
+    assert ok and not code
+
+    # device 模式遗留会话（存的是浏览器 ID）→ 放行（切换 scope 不误踢）
+    ok, code, _ = dvb.check_session_ip_pure("browser-uuid-1234", "web", now, net, set(), 7, now)
+    assert ok and not code
+
+    # 同网络（不管哪个浏览器/设备发起）→ 放行
+    ok, code, _ = dvb.check_session_ip_pure(net, "web", now, net, {net}, 7, now)
+    assert ok and not code
+
+    # 拿不到请求 IP → 不作为踢出证据，放行（fail-open）
+    ok, code, _ = dvb.check_session_ip_pure(net, "web", now, None, {net}, 7, now)
+    assert ok and not code
+
+    # 换到另一个公网网段 → network_changed（重新登录即换绑）
+    ok, code, _ = dvb.check_session_ip_pure(net, "web", now, "5.6.7.0/24", {net}, 7, now)
+    assert not ok and code == "network_changed"
+
+    # 绑定已被新网络顶掉 → kicked
+    ok, code, msg = dvb.check_session_ip_pure(net, "web", now, net, {"5.6.7.0/24"}, 7, now)
+    assert not ok and code == "kicked" and "其他网络" in msg
+
+    # 空闲超时
+    old = now - timedelta(days=8)
+    ok, code, _ = dvb.check_session_ip_pure(net, "web", old, net, {net}, 7, now)
+    assert not ok and code == "session_expired"
+
+    # 内网部署：lan ↔ lan 一直放行
+    ok, code, _ = dvb.check_session_ip_pure("lan", "web", now, "lan", {"lan"}, 7, now)
+    assert ok and not code
+
+
+def test_login_identity_default_scope_ip():
+    """默认 scope=ip：登录标识取网络键；拿不到 IP 回退 deviceId。"""
+    assert dvb.binding_scope() == dvb.SCOPE_IP               # 未配置 → 默认宽松
+    assert dvb.login_identity("browser-id", "1.2.3.4") == "1.2.3.0/24"
+    assert dvb.login_identity("browser-id", "192.168.0.2") == "lan"
+    assert dvb.login_identity("browser-id", None) == "browser-id"   # 无 IP → 回退
+    assert dvb.login_identity(None, None) is None
+
+
+def test_ip_mode_bind_and_evict_integration():
+    """ip 模式集成：同网络多浏览器共存一条绑定；换网络登录顶掉旧网络会话。"""
+    SessionLocal = _setup_db()
+    db = SessionLocal()
+    try:
+        card = _mk_card(db, "XM-TEST-0006", max_devices=1)
+        net_home = dvb.ip_scope_key("1.2.3.4")               # 家里
+        net_other = dvb.ip_scope_key("5.6.7.8")              # 别人家
+
+        # 家里 Chrome 登录 → 绑定家庭网络
+        dvb.bind_device_on_login(db, card, "web", net_home, "1.2.3.4")
+        _mk_session(db, card, net_home, "web", token="tok-home-chrome")
+        db.commit()
+
+        # 家里 Edge 再登录（同网络）→ 不换绑、不踢人，共用同一绑定
+        r = dvb.bind_device_on_login(db, card, "web", dvb.ip_scope_key("1.2.3.77"), "1.2.3.77")
+        _mk_session(db, card, net_home, "web", token="tok-home-edge")
+        db.commit()
+        assert r["evicted"] == [] and r["kicked_sessions"] == 0
+        assert dvb.bound_device_ids(db, card.id, "web") == {net_home}
+
+        # 两个浏览器的会话都通过校验
+        for _tok in ("tok-home-chrome", "tok-home-edge"):
+            ok, code, _ = dvb.check_session_ip_pure(
+                net_home, "web", datetime.now(timezone.utc),
+                dvb.ip_scope_key("1.2.3.200"),               # 同 /24 内任意来源
+                dvb.bound_device_ids(db, card.id, "web"), 7,
+            )
+            assert ok and not code
+
+        # 换到另一个家庭 IP 登录 → 顶号：旧网络绑定被淘汰、其会话全部失效
+        r2 = dvb.bind_device_on_login(db, card, "web", net_other, "5.6.7.8")
+        db.commit()
+        assert r2["evicted"] == [net_home]
+        assert r2["kicked_sessions"] == 2                    # 家里两个浏览器会话都被踢
+        assert dvb.bound_device_ids(db, card.id, "web") == {net_other}
+
+        # 旧网络会话再来 → kicked
+        ok, code, _ = dvb.check_session_ip_pure(
+            net_home, "web", datetime.now(timezone.utc), net_home,
+            dvb.bound_device_ids(db, card.id, "web"), 7,
+        )
+        assert not ok and code == "kicked"
+    finally:
+        db.close()
+
+
+def test_resolve_client_ip():
+    """真实 IP 解析：默认不信 XFF；开启 trust_proxy_header 后取首个合法 XFF IP。"""
+    class _Cli:
+        host = "9.9.9.9"
+
+    class _Req:
+        client = _Cli()
+        headers = {"x-forwarded-for": "1.2.3.4, 10.0.0.1", "x-real-ip": "5.6.7.8"}
+
+    # 默认（不信任代理头）→ 直连 IP
+    assert dvb.resolve_client_ip(_Req()) == "9.9.9.9"
+
+    # 开启 trust_proxy_header → 取 XFF 首个合法 IP
+    from db.models import ApiConfig
+    SessionLocal = _setup_db()
+    db = SessionLocal()
+    try:
+        db.add(ApiConfig(cfg_key="trust_proxy_header", cfg_value="1", category="settings"))
+        db.commit()
+        dvb.invalidate_cfg_cache()
+        assert dvb.resolve_client_ip(_Req()) == "1.2.3.4"
+
+        # XFF 全非法 → 回退 X-Real-IP
+        class _Req2(_Req):
+            headers = {"x-forwarded-for": "evil, <script>", "x-real-ip": "5.6.7.8"}
+        assert dvb.resolve_client_ip(_Req2()) == "5.6.7.8"
+
+        # 两个头都没有 → 回退直连 IP
+        class _Req3(_Req):
+            headers = {}
+        assert dvb.resolve_client_ip(_Req3()) == "9.9.9.9"
+    finally:
+        # 还原配置，避免影响其它用例
+        row = db.query(ApiConfig).filter_by(cfg_key="trust_proxy_header").first()
+        if row:
+            db.delete(row)
+            db.commit()
+        dvb.invalidate_cfg_cache()
+        db.close()
+
+
 if __name__ == "__main__":
     test_normalize_client_type()
     test_get_max_devices()
@@ -295,4 +459,10 @@ if __name__ == "__main__":
     test_trim_bindings_to_limit()
     test_risk_ip_network_key()
     test_risk_record_token_ip()
+    test_ip_scope_key()
+    test_is_ip_scope_key()
+    test_check_session_ip_pure()
+    test_login_identity_default_scope_ip()
+    test_ip_mode_bind_and_evict_integration()
+    test_resolve_client_ip()
     print("ALL PASS")

@@ -35,20 +35,22 @@ def parse_captcha(svg_uri: str) -> str:
     return "".join(chars)
 
 
-def do_login(client, code, device_id=None, client_type="web"):
+def do_login(client, code, device_id=None, client_type="web", headers=None):
     """走完整登录（含验证码），返回 (status, json)"""
-    cap = client.get("/api/auth/captcha").json()
+    cap = client.get("/api/auth/captcha", headers=headers or {}).json()
     body = {"code": code, "captchaId": cap["captchaId"], "captcha": parse_captcha(cap["svg"]), "client": client_type}
     if device_id is not None:
         body["deviceId"] = device_id
-    r = client.post("/api/auth/login", json=body)
+    r = client.post("/api/auth/login", json=body, headers=headers or {})
     return r.status_code, r.json()
 
 
-def me(client, token, device_id=None):
+def me(client, token, device_id=None, extra_headers=None):
     headers = {"Authorization": f"Bearer {token}"}
     if device_id:
         headers["X-Device-Id"] = device_id
+    if extra_headers:
+        headers.update(extra_headers)
     r = client.get("/api/auth/me", headers=headers)
     return r.status_code, (r.json() if r.content else {})
 
@@ -67,8 +69,9 @@ def main():
         assert r.json().get("success"), r.text
         card_code = r.json()["codes"][0]
 
-        # ── 开启设备绑定（保存后即时生效）──
-        r = client.put("/api/admin/config", headers=admin_token, json={"config": {"device_binding_enabled": "1"}})
+        # ── 开启设备绑定（保存后即时生效）：本段验证「严格按浏览器设备」粒度 ──
+        r = client.put("/api/admin/config", headers=admin_token,
+                       json={"config": {"device_binding_enabled": "1", "device_binding_scope": "device"}})
         assert r.json().get("success"), r.text
 
         # a. 网页端设备A登录
@@ -149,6 +152,66 @@ def main():
         assert code_i == 200                                          # 存量放行至自然重登录
         code_n, _ = me(client, ji["token"], "dev-NEW2")               # 新设备正常
         assert code_n == 200
+
+        # ════════════════════════════════════════
+        #  宽松粒度（scope=ip）：同 IP 不限设备，换公网 IP 才顶号
+        #  用 trust_proxy_header + X-Forwarded-For 模拟不同家庭网络
+        # ════════════════════════════════════════
+        r = client.put("/api/admin/config", headers=admin_token, json={"config": {
+            "device_binding_enabled": "1", "device_binding_scope": "ip", "trust_proxy_header": "1",
+        }})
+        assert r.json().get("success"), r.text
+
+        r = client.post("/api/admin/cards/generate", headers=admin_token, json={
+            "count": 1, "expiry_type": "fixed", "expires_at": "2099-01-01T00:00:00+00:00", "max_devices": 1,
+        })
+        card2 = r.json()["codes"][0]
+        home = {"X-Forwarded-For": "23.5.6.10"}       # 家里（公网 /24: 23.5.6.0/24）
+        home2 = {"X-Forwarded-For": "23.5.6.200"}     # 家里另一台设备（同 /24 → 同一网络）
+        other = {"X-Forwarded-For": "98.7.6.5"}       # 别人家（另一个公网网段）
+
+        # a. 家里 Chrome 登录（ip 模式不要求 deviceId）
+        s1, j1 = do_login(client, card2, None, "web", headers=home)
+        assert s1 == 200 and j1["success"], (s1, j1)
+        tok_home1 = j1["token"]
+
+        # b. 家里 Edge / 手机再登录（同 IP 段）→ 不顶号，两个会话共存
+        s2, j2 = do_login(client, card2, None, "web", headers=home2)
+        assert s2 == 200 and j2["success"], (s2, j2)
+        tok_home2 = j2["token"]
+        assert me(client, tok_home1, None, home)[0] == 200      # 第一个浏览器仍在线
+        assert me(client, tok_home2, None, home2)[0] == 200     # 第二个也在线
+        # 不带任何设备头、换个浏览器环境（同 IP）→ 照样放行
+        assert me(client, tok_home1, "whatever-browser", home2)[0] == 200
+
+        # c. token 拿到别的网络用 → 401 网络环境已变更（防 token 外带）
+        code_t, body_t = me(client, tok_home1, None, other)
+        assert code_t == 401 and "网络环境已变更" in body_t.get("detail", ""), (code_t, body_t)
+        # 回到家里网络 → 恢复可用（未被顶号，只是拒绝异网使用）
+        assert me(client, tok_home1, None, home)[0] == 200
+
+        # d. 别人家登录 → 顶掉家庭网络的全部会话
+        s3, j3 = do_login(client, card2, None, "web", headers=other)
+        assert s3 == 200 and j3["success"], (s3, j3)
+        tok_other = j3["token"]
+        code_h1, body_h1 = me(client, tok_home1, None, home)
+        assert code_h1 == 401 and "其他网络" in body_h1.get("detail", ""), (code_h1, body_h1)
+        code_h2, _ = me(client, tok_home2, None, home2)
+        assert code_h2 == 401
+        assert me(client, tok_other, None, other)[0] == 200     # 新网络正常
+
+        # e. 管理端设备列表展示网络绑定
+        r = client.get("/api/admin/cards/2/devices", headers=admin_token)
+        j = r.json()
+        assert j["success"] and j["binding_scope"] == "ip", j
+        web_nets = [d["device_id"] for d in j["devices"]["web"]]
+        assert web_nets == ["98.7.6.0/24"], web_nets            # 家庭网段已被顶掉
+
+        # 还原配置，避免影响后续手工调试
+        r = client.put("/api/admin/config", headers=admin_token, json={"config": {
+            "device_binding_enabled": "0", "trust_proxy_header": "0",
+        }})
+        assert r.json().get("success")
 
         print("E2E ALL PASS")
 

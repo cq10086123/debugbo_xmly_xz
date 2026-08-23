@@ -24,19 +24,21 @@ async def _auth_card(raw_token: str, device_id: str | None = None, client_ip: st
         if not sess:
             # 设备绑定语义优化：token 已失效时回查归属，被顶号/解绑的设备给出明确提示
             # （顶号时旧 token 被直接置 inactive，走不到下方设备校验分支）
-            if device_id:
-                from core import device_binding as _dvb0
-                try:
-                    old = db.query(CardSession).filter_by(token=raw_token).first()
-                    if (old is not None and not old.is_active and old.device_id
-                            and old.device_id == device_id and old.client_type
-                            and _dvb0.device_binding_enabled()
-                            and old.device_id not in _dvb0.bound_device_ids(db, old.card_id, old.client_type)):
-                        raise HTTPException(status_code=401, detail="账号已在其他设备登录，本设备已下线")
-                except HTTPException:
-                    raise
-                except Exception:
-                    pass
+            from core import device_binding as _dvb0
+            try:
+                request_identity = _dvb0.login_identity(device_id, client_ip)
+                old = db.query(CardSession).filter_by(token=raw_token).first() if request_identity else None
+                if (old is not None and not old.is_active and old.device_id
+                        and old.device_id == request_identity and old.client_type
+                        and _dvb0.device_binding_enabled()
+                        and old.device_id not in _dvb0.bound_device_ids(db, old.card_id, old.client_type)):
+                    if _dvb0.binding_scope() == _dvb0.SCOPE_IP:
+                        raise HTTPException(status_code=401, detail="账号已在其他网络登录，本设备已下线")
+                    raise HTTPException(status_code=401, detail="账号已在其他设备登录，本设备已下线")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
             raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
 
         card = sess.card
@@ -51,7 +53,7 @@ async def _auth_card(raw_token: str, device_id: str | None = None, client_ip: st
         # 唯一接入点：所有业务路由（搜索/下载/重试/插件等）经此依赖自动受控，
         # 业务文件零改动。校验失败返回带语义的 401，客户端据此提示"已被顶下线"。
         from core import device_binding as _dvb
-        ok, _code, message = _dvb.check_session(db, sess, device_id)
+        ok, _code, message = _dvb.check_session(db, sess, device_id, client_ip)
         if not ok:
             raise HTTPException(status_code=401, detail=message)
 
@@ -135,7 +137,8 @@ async def get_current_card(
     token = authorization[7:].strip()
     if not token:
         raise HTTPException(status_code=401, detail="未登录或 token 缺失")
-    client_ip = request.client.host if request is not None and request.client else None
+    from core.device_binding import resolve_client_ip
+    client_ip = resolve_client_ip(request)
     return await _auth_card(token, (x_device_id or "").strip() or None, client_ip)
 
 
@@ -159,7 +162,8 @@ async def get_current_card_download(
     if not raw:
         raise HTTPException(status_code=401, detail="未登录或 token 缺失")
     dev = (x_device_id or device or "").strip() or None
-    client_ip = request.client.host if request is not None and request.client else None
+    from core.device_binding import resolve_client_ip
+    client_ip = resolve_client_ip(request)
     return await _auth_card(raw, dev, client_ip)
 
 

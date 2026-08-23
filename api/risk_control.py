@@ -121,6 +121,12 @@ def check_seat_ip_mismatch(card_id: int, client_type: str | None, ip: str | None
     """
     if not client_type or not ip or not other_seat_ip:
         return
+    try:
+        from core.device_binding import binding_scope, SCOPE_IP
+        if binding_scope() == SCOPE_IP:
+            return  # 宽松模式按网络绑定，主校验已保证同网络，席位检测无意义
+    except Exception:
+        pass
     net_a = _ip_network_key(ip)
     net_b = _ip_network_key(other_seat_ip)
     if net_a is None or net_b is None or net_a == net_b:

@@ -33,10 +33,12 @@ _state_lock = threading.Lock()
 
 
 def _client_ip(request: Request) -> str:
-    # 直连部署：不信 X-Forwarded-For——攻击者每请求换一个伪造 IP 即可让按 IP
+    # 直连部署默认不信 X-Forwarded-For——攻击者每请求换一个伪造 IP 即可让按 IP
     # 计数的失败锁定失效（与 app.py 的 admin_lan_only 中间件同一原则）。
-    # 若将来引入可信反向代理，需按白名单在此解析 XFF。
-    return request.client.host if request.client else "unknown"
+    # 管理端开启 trust_proxy_header（可信反代部署）后才解析 XFF/X-Real-IP，
+    # 统一走 core.device_binding.resolve_client_ip（IP 绑定/限流同一来源）。
+    from core.device_binding import resolve_client_ip
+    return resolve_client_ip(request) or "unknown"
 
 
 def _gen_captcha() -> tuple[str, str]:
@@ -180,14 +182,27 @@ async def login(req: LoginRequest, request: Request):
             client_type = dvb.normalize_client_type(req.client)
             if not client_type:
                 raise HTTPException(status_code=400, detail="client 参数非法（仅支持 web / extension）")
-            device_id = (req.deviceId or "").strip()
-            if not device_id or len(device_id) > 64:
-                # 开关开启后必须携带设备 ID，否则删除该字段即可绕过绑定
-                raise HTTPException(
-                    status_code=403,
-                    detail="当前服务器已开启设备绑定，请更新网页（刷新页面）或插件到最新版本后重试",
-                )
-            dvb.bind_device_on_login(db, card, client_type, device_id, client_ip)
+            raw_device_id = (req.deviceId or "").strip()
+            if len(raw_device_id) > 64:
+                raw_device_id = ""
+            if dvb.binding_scope() == dvb.SCOPE_IP:
+                # 宽松模式：按出口网络绑定，同一 IP 下不限设备/浏览器，
+                # deviceId 可选（拿不到 IP 时才回退 deviceId 兜底）。
+                device_id = dvb.login_identity(raw_device_id or None, client_ip)
+                if device_id:
+                    dvb.bind_device_on_login(db, card, client_type, device_id, client_ip)
+                # device_id 为 None（既无 IP 也无 deviceId）：不建绑定、会话按
+                # 历史免设备会话处理（校验放行），fail-open 不阻断登录。
+            else:
+                # 严格模式（旧行为）：必须携带浏览器 deviceId
+                device_id = raw_device_id
+                if not device_id:
+                    # 开关开启后必须携带设备 ID，否则删除该字段即可绕过绑定
+                    raise HTTPException(
+                        status_code=403,
+                        detail="当前服务器已开启设备绑定，请更新网页（刷新页面）或插件到最新版本后重试",
+                    )
+                dvb.bind_device_on_login(db, card, client_type, device_id, client_ip)
         else:
             # 开关关闭 = 完全恢复历史行为：不校验、也不落 device_id 到会话。
             # 注意不能"顺手记录" device_id：若记录了但未建绑定，之后开启开关时

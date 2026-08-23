@@ -506,6 +506,7 @@ async def list_card_devices(card_id: int, _: bool = Depends(get_current_admin)):
             "card_id": card.id,
             "max_devices": dvb.get_max_devices(card),
             "binding_enabled": dvb.device_binding_enabled(),
+            "binding_scope": dvb.binding_scope(),
             "active_sessions": active_sessions,
             "devices": devices,
         }

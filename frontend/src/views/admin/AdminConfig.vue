@@ -19,8 +19,13 @@ const fields = [
   { key: 'auto_retry_max_rounds', label: '最大重试轮数', type: 'number' },
   { key: 'admin_path', label: '后台管理地址', type: 'text' },
   { key: 'admin_lan_only', label: '局域网访问限制', type: 'bool' },
-  { key: 'device_binding_enabled', label: '设备绑定（一卡一机）', type: 'bool' },
+  { key: 'device_binding_enabled', label: '设备绑定', type: 'bool' },
+  { key: 'device_binding_scope', label: '绑定粒度', type: 'select', options: [
+    { value: 'ip', label: '按网络IP（宽松：同IP不限设备）' },
+    { value: 'device', label: '按浏览器设备（严格：一卡一机）' },
+  ] },
   { key: 'session_idle_days', label: '会话空闲过期(天)', type: 'number' },
+  { key: 'trust_proxy_header', label: '信任反代IP头(XFF)', type: 'bool' },
   { key: 'token_multi_ip_kick', label: '同token多IP强制下线', type: 'bool' },
   { key: 'device_seat_ip_mismatch', label: '席位IP不一致处置', type: 'text' },
 ]
@@ -99,6 +104,10 @@ onMounted(load)
         <label>{{ f.label }}</label>
         <input v-if="f.type==='text'" v-model="cfg[f.key]" :placeholder="f.key" />
         <input v-else-if="f.type==='number'" v-model="cfg[f.key]" type="number" style="max-width:160px" />
+        <select v-else-if="f.type==='select'" v-model="cfg[f.key]">
+          <option v-if="!cfg[f.key]" value="">默认（{{ f.options[0].label }}）</option>
+          <option v-for="o in f.options" :key="o.value" :value="o.value">{{ o.label }}</option>
+        </select>
         <label v-else-if="f.type==='bool'" class="switch">
           <input type="checkbox" :checked="modelValue(f)" @change="cfg[f.key] = $event.target.checked ? '1' : '0'" />
           <span>{{ modelValue(f) ? '开启' : '关闭' }}</span>
@@ -109,10 +118,15 @@ onMounted(load)
         小写字母开头，仅含小写字母/数字/-/_，修改后<b>需重启服务</b>才生效。
         管理后台 API 与文档页受「局域网访问限制」开关控制：开启时仅允许局域网 IP 访问，关闭后公网也可访问（请确保已修改强密码，并尽量走 HTTPS）。
         <br />
-        「设备绑定」开启后：卡密按席位绑定设备（网页席/插件席各限若干台，默认 1 台，卡密管理中可按卡调整），新设备登录自动顶掉旧设备；
-        存量已登录用户不受影响，下次登录起绑定。关闭 = 完全恢复历史行为（一键回退）。
-        「同token多IP强制下线」：同一登录凭证在 10 分钟内来自多个公网 IP 时判定共享并强制下线。
-        「席位IP不一致处置」：alert=仅记录告警日志；enforce 可扩展为强制踢出（当前版本同 alert）。
+        「设备绑定」开启后按「绑定粒度」限制登录环境，新环境登录自动顶掉最旧绑定；存量已登录用户不受影响，下次登录起绑定。关闭 = 完全恢复历史行为（一键回退）。
+        <br />
+        「绑定粒度」：<b>按网络IP（宽松，默认）</b>= 同一出口 IP（同一家庭宽带，IPv4 按 /24、IPv6 按 /48 归一，局域网视为同一网络）下不限设备与浏览器数量，只有换到另一个公网 IP 登录才触发顶号换绑；
+        <b>按浏览器设备（严格）</b>= 每席位绑定具体浏览器（同一台电脑的不同浏览器也算不同设备）。切换粒度不会踢出已在线用户，下次登录起按新粒度绑定。
+        <br />
+        「信任反代IP头」：服务部署在 nginx 等<b>可信反向代理</b>之后时开启，从 X-Forwarded-For / X-Real-IP 取真实客户端 IP（按网络IP绑定、登录限流依赖真实 IP）；<b>直连部署务必保持关闭</b>，否则该头可被伪造。
+        <br />
+        「同token多IP强制下线」：同一登录凭证在 10 分钟内来自多个公网网段时判定共享并强制下线。
+        「席位IP不一致处置」：alert=仅记录告警日志；enforce 可扩展为强制踢出（当前版本同 alert；绑定粒度为按网络IP时自动跳过）。
       </p>
       <button class="success" :disabled="saving" @click="save">{{ saving ? '保存中…' : '💾 保存配置' }}</button>
     </div>
@@ -151,7 +165,7 @@ onMounted(load)
 .form { display: flex; flex-direction: column; gap: 14px; max-width: 620px; }
 .row { display: flex; align-items: center; gap: 14px; }
 .row label:first-child { width: 130px; color: var(--text-dim); font-size: 13px; flex-shrink: 0; }
-.row input[type=text], .row input[type=number] { flex: 1; }
+.row input[type=text], .row input[type=number], .row select { flex: 1; }
 .switch { display: flex; align-items: center; gap: 8px; }
 .switch input { width: auto; }
 .hint { font-size: 12px; line-height: 1.7; margin: 0; }
