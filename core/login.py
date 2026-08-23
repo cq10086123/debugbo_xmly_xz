@@ -5,13 +5,11 @@
 登录成功或超时后由调用方调用 cleanup_qr 清理。
 """
 
-import base64
 import uuid
 import time
 import urllib3
 import requests
-from datetime import datetime
-from core.config import COOKIE_FILE, POLL_INTERVAL, POLL_TIMEOUT
+from core.config import COOKIE_FILE
 
 # 关闭 SSL 证书验证警告（内网工具）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

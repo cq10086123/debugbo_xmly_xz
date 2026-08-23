@@ -178,7 +178,7 @@ def parse(params):
 '''
 
 
-def get_all_examples() -> Dict[str, str]:
+def get_all_examples() -> dict[str, str]:
     """获取所有示例脚本"""
     return {
         "search": SEARCH_SCRIPT,

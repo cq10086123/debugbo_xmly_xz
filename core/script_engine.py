@@ -48,7 +48,7 @@ import time
 import traceback
 import urllib.parse
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import urllib3
@@ -400,7 +400,7 @@ def _worker_main(conn, source: str) -> None:
             func = g.get(fn)
             if not callable(func):
                 raise RuntimeError(
-                    f"脚本未定义主函数: parse（请像参考项目一样定义 def parse(params): 函数）"
+                    "脚本未定义主函数: parse（请像参考项目一样定义 def parse(params): 函数）"
                 )
             val = func(*args)
             result = {"id": cid, "ok": True, "value": _safe_serialize(val)}

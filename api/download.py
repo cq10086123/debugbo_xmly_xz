@@ -141,7 +141,6 @@ async def _run_batch_task(task_id: str, album_id: int, quality: int,
     task = _batch_tasks[task_id]
     card_id = task["card_id"]
     download_root = task["download_root"]
-    engine = "official"
 
     def _is_rate_limited(error_msg: str) -> bool:
         return any(kw in error_msg for kw in ("网络繁忙", "明天再试", "访问过于频繁", "请求过于频繁"))

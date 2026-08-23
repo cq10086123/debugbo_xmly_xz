@@ -47,7 +47,7 @@ def _admin_register_fail(ip: str) -> None:
 
 from db.session import SessionLocal
 from db.models import (
-    Admin, AdminToken, Card, ApiConfig, Interface, LocalTask, BackendXmAccount,
+    Admin, AdminToken, Card, ApiConfig, Interface, LocalTask,
     Session as CardSession,
 )
 from api.deps import get_current_admin

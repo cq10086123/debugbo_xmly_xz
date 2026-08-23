@@ -10,7 +10,6 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
 
 from db.session import SessionLocal
 from db.models import Session as CardSession
