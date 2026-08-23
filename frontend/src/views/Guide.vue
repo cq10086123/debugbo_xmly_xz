@@ -1,5 +1,6 @@
 <script setup>
 import { getBizToken } from '../utils/request'
+import { getDeviceId } from '../utils/deviceId'
 
 function downloadExtension() {
   const token = getBizToken()
@@ -7,8 +8,9 @@ function downloadExtension() {
     alert('请先登录卡密后再下载插件')
     return
   }
+  // 原生导航无法带请求头 → 设备 ID 走查询参数（与 Files.vue 的直链下载一致）
   const a = document.createElement('a')
-  a.href = `/api/files/extension-zip?token=${encodeURIComponent(token)}`
+  a.href = `/api/files/extension-zip?token=${encodeURIComponent(token)}&device=${encodeURIComponent(getDeviceId())}`
   a.download = 'yousheng_extension.zip'
   document.body.appendChild(a)
   a.click()

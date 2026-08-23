@@ -3,6 +3,7 @@
 表清单：
 - cards            卡密表
 - sessions         卡密登录会话表
+- device_bindings  卡密设备绑定表（席位×设备，core/device_binding.py 维护）
 - admin_tokens     管理员会话 token 表
 - admins           管理员账号表
 - api_config       接口与密钥配置表（替代 config.json）
@@ -51,10 +52,14 @@ class Card(Base):
     # 下载模式权限：server=仅服务器下载 | local=仅本地下载 | both=都允许（默认）
     # NULL 与 'both' 等价，保证历史卡与未设置卡向后兼容（两种都可用）
     download_mode = mapped_column(String(16), default="both", nullable=True)
+    # 设备绑定：每席位（web/extension）允许绑定的设备数（默认 1）
+    # NULL → 按 1 处理；由 core/device_binding.py 统一读取，业务代码不直接判空
+    max_devices = mapped_column(Integer, nullable=True)
     created_at = mapped_column(DateTime, default=_utcnow, nullable=False)
     last_login_at = mapped_column(DateTime, nullable=True)
 
     sessions = relationship("Session", back_populates="card", cascade="all, delete-orphan")
+    devices = relationship("DeviceBinding", back_populates="card", cascade="all, delete-orphan")
     tasks = relationship("DownloadTask", back_populates="card", cascade="all, delete-orphan")
     records = relationship("DownloadRecord", back_populates="card", cascade="all, delete-orphan")
     accounts = relationship("XimalayaAccount", back_populates="card", cascade="all, delete-orphan")
@@ -69,8 +74,35 @@ class Session(Base):
     created_at = mapped_column(DateTime, default=_utcnow, nullable=False)
     last_active_at = mapped_column(DateTime, default=_utcnow, nullable=False)
     is_active = mapped_column(Boolean, default=True, nullable=False)
+    # ── 设备绑定（core/device_binding.py 维护，全部可空以保证存量数据兼容）──
+    client_type = mapped_column(String(8), nullable=True)   # web | extension；NULL=历史会话
+    device_id = mapped_column(String(64), nullable=True, index=True)  # 客户端设备 ID；NULL=历史会话
+    ip = mapped_column(String(64), nullable=True)           # 登录时出口 IP（风控用）
 
     card = relationship("Card", back_populates="sessions")
+
+
+class DeviceBinding(Base):
+    """设备绑定表 — 卡密席位与设备的当前绑定关系（core/device_binding.py 独占维护）
+
+    席位模型：每张卡密有 web / extension 两类席位，各允许 max_devices 台设备。
+    新设备登录且席位已满 → 淘汰 bound_at 最早的绑定（顶号换绑）并失效其会话。
+    """
+
+    __tablename__ = "device_bindings"
+    __table_args__ = (
+        UniqueConstraint("card_id", "client_type", "device_id", name="uq_card_client_device"),
+    )
+
+    id = mapped_column(Integer, primary_key=True)
+    card_id = mapped_column(Integer, ForeignKey("cards.id"), nullable=False, index=True)
+    client_type = mapped_column(String(8), nullable=False)  # web | extension
+    device_id = mapped_column(String(64), nullable=False)
+    bound_at = mapped_column(DateTime, default=_utcnow, nullable=False)
+    last_active_at = mapped_column(DateTime, default=_utcnow, nullable=False)
+    last_ip = mapped_column(String(64), nullable=True)
+
+    card = relationship("Card", back_populates="devices")
 
 
 class AdminToken(Base):

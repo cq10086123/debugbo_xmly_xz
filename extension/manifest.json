@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "有声下载·本地插件",
-  "version": "0.5.3",
-  "description": "把音频获取接口放到用户浏览器，走用户 IP 解析并下载到本地，节省服务器空间",
+  "version": "0.6.0",
+  "description": "把音频获取接口放到用户浏览器，走用户 IP 解析并下载到本地，节省服务器空间（支持卡密设备绑定）",
   "permissions": ["storage", "downloads", "downloads.ui", "alarms", "offscreen", "cookies", "notifications"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },

@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { bizApi, adminApi, getBizToken, getAdminToken, setBizToken, setAdminToken } from '../utils/request'
+import { getDeviceId } from '../utils/deviceId'
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -13,7 +14,12 @@ export const useAuthStore = defineStore('auth', {
   },
   actions: {
     async login(code, captchaId, captcha) {
-      const { data } = await bizApi.post('/auth/login', { code, captchaId, captcha })
+      // 设备绑定：携带本浏览器设备 ID 与端类型（服务端开关关闭时忽略）
+      const { data } = await bizApi.post('/auth/login', {
+        code, captchaId, captcha,
+        deviceId: getDeviceId(),
+        client: 'web',
+      })
       if (data.success) {
         this.bizToken = data.token
         this.card = data.card

@@ -1,13 +1,24 @@
 <script setup>
-import { onMounted } from 'vue'
+import { onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()
 const router = useRouter()
 
+// 登录态心跳（60s）：服务端开启设备绑定后，本机被顶号/踢下线时
+// 经 /auth/me 的 401 → 拦截器清 token + 提示 + 跳登录，实现分钟级感知。
+let heartbeatTimer = null
+
 onMounted(async () => {
   if (!auth.card) await auth.fetchMe()
+  heartbeatTimer = setInterval(() => {
+    if (auth.bizToken) auth.fetchMe()
+  }, 60000)
+})
+
+onUnmounted(() => {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null }
 })
 
 async function logout() {

@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { bizApi, getBizToken } from '../utils/request'
+import { getDeviceId } from '../utils/deviceId'
 import { useToast } from '../utils/toast'
 
 const toast = useToast()
@@ -40,7 +41,8 @@ function downloadZip(albumName) {
   if (!token) { toast.error('未登录或登录已失效'); return }
   // 原生下载：直接让浏览器请求带 token 的 URL 并流式写入磁盘，
   // 不经过 fetch/blob，避免大文件占满内存或被提前 revoke 导致下载中断。
-  const url = `/api/files/album-zip?album=${encodeURIComponent(albumName)}&token=${encodeURIComponent(token)}`
+  // 原生导航无法带自定义请求头 → 设备 ID 同样走查询参数（服务端 get_current_card_download 支持）。
+  const url = `/api/files/album-zip?album=${encodeURIComponent(albumName)}&token=${encodeURIComponent(token)}&device=${encodeURIComponent(getDeviceId())}`
   const a = document.createElement('a')
   a.href = url
   a.download = `${albumName}.zip`
@@ -53,7 +55,7 @@ function downloadZip(albumName) {
 function downloadFile(path, name) {
   const token = getBizToken()
   if (!token) { toast.error('未登录或登录已失效'); return }
-  const url = `/api/files/file/${encodeURIComponent(path)}?token=${encodeURIComponent(token)}`
+  const url = `/api/files/file/${encodeURIComponent(path)}?token=${encodeURIComponent(token)}&device=${encodeURIComponent(getDeviceId())}`
   const a = document.createElement('a')
   a.href = url
   a.download = name
