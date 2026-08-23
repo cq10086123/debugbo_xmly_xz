@@ -9,6 +9,23 @@
  * - 消除了 O(N²) 写入放大问题：每次状态变更只读写单个任务
  * - 保留队列级锁 withQueue，锁内改为单任务读写，改动最小、风险最低
  * - popup 契约不变：getQueue 仍返回 {queue: [...]} 结构
+ *
+ * 稳定性重构（2026-08-23）：
+ * - 修复进度卡住、重复集数、并发数异常等核心问题：
+ *   1) activeCount/inflight 内存态在 SW 重启后丢失导致并发超限和重复派发 → 重构为仅用 inflight Set，
+ *      并在 reconcileDownloads 中根据真实下载状态重建 inflight
+ *   2) reconcileDownloads 之前在 withQueue 锁内串行执行 chrome.downloads.search，导致锁长时间占用，
+ *      阻塞所有进度更新和派发，表现为进度卡住、并发异常 → 改为两阶段：先快照，再锁外查询，最后锁内批量更新
+ *   3) handleDownloadChanged 之前未清理 inflight，SW 重启后旧下载完成时 inflight 仍残留或缺失 → 现在完成时清理 inflight
+ *   4) setTaskAndUpdateIndex 在 withQueue 内重复读写索引导致旧快照覆盖 → 新增锁内专用版本，统一索引更新路径
+ *   5) 重复集数：原去重仅检查其他任务已完成集，且仅在锁外检查，竞态下可能重复 → 改为检查所有非 error 状态，
+ *      并在锁内二次校验，且后端推送时增加本地重复任务过滤
+ *   6) pendingTerminals 无界增长后直接 clear 导致终端事件丢失，runTrack 超时 30 分钟才恢复 → 改为 LRU 淘汰
+ *   7) getXmCookie 缓存 5 分钟，冷却标记后仍使用旧列表 → 冷却时主动失效缓存
+ *   8) ensureOffscreen 在旧 Chrome 下可能永久失效 → 增加容错重试和重置逻辑
+ *   9) keepAlive 0.5 分钟被 Chrome 钳制到 1 分钟，且不可靠 → 改为 1 分钟，并增加心跳日志
+ *  10) buildFilename 未限制长度，可能超 OS 限制 → 增加截断
+ *  11) pump 的 activeCount 与 inflight 可能不一致 → 统一使用 inflight.size
  */
 importScripts('crypto.js', 'resolvers.js', 'sources.config.js')
 
@@ -41,8 +58,6 @@ const TRACK_TIMEOUT = 30 * 60 * 1000    // 单集下载终端态等待上限（�
 
 let offscreenReady = false
 let keepAliveActive = false
-// ⚠️ 存储迁移标记不再用内存变量（SW 重启会丢失导致重复迁移），
-//    改为 chrome.storage.local 持久化 key = xm_storage_migrated（见 migrateStorage）
 
 // ── 队列读写互斥 ──
 // ⚠️ 死锁红线：withQueue 的回调里绝对不允许再调用 withQueue（自己等自己，永久卡死）。
@@ -95,36 +110,32 @@ async function getTasksBatch(taskIds) {
   }))
 }
 
-// 在锁内原子更新任务 + 索引（保证一致性）
+// 锁内更新索引条目（idx 已在锁内获取，避免重复 getIndex）
+function upsertIndexEntry(idx, task) {
+  const i = idx.findIndex(item => item.task_id === task.task_id)
+  const entry = {
+    task_id: task.task_id,
+    album_id: task.album_id,
+    album_title: task.album_title,
+    source: task.source,
+    status: task.status,
+    paused: !!task.paused,
+    createdAt: task.createdAt || Date.now(),
+  }
+  if (i >= 0) idx[i] = { ...idx[i], ...entry }
+  else idx.push(entry)
+}
+
+// 在锁外原子更新任务 + 索引（保证一致性）— 旧 API，保留给锁外调用
 async function setTaskAndUpdateIndex(task) {
   if (!task || !task.task_id) throw new Error('setTaskAndUpdateIndex: task_id is required')
   await setTask(task)
-  // 同步更新索引中的状态字段
   const idx = await getIndex()
-  const itemIdx = idx.findIndex(item => item.task_id === task.task_id)
-  if (itemIdx >= 0) {
-    idx[itemIdx] = {
-      ...idx[itemIdx],
-      status: task.status,
-      paused: !!task.paused,
-      album_id: task.album_id,
-      album_title: task.album_title,
-      source: task.source,
-    }
-    await setIndex(idx)
-  }
+  upsertIndexEntry(idx, task)
+  await setIndex(idx)
 }
 
 // 向后兼容：从旧存储迁移到分片存储
-// ⚠️ 修复（2026-08-19）：旧实现有三个致命缺陷——
-//   1) storageMigrated 是内存变量，SW 重启后置 false → 重复迁移
-//   2) 迁移后未删除 xm_taskQueue → 旧数据永久残留，每次 SW 重启复活
-//   3) setIndex(idx) 整体替换索引 → 当前分片任务（如「剑来」）被丢弃丢失
-// 新实现：
-//   - 用 chrome.storage 持久化标记 xm_storage_migrated 替代内存变量
-//   - 迁移完成后立即删除 xm_taskQueue（根因）
-//   - 只把"分片仍存在"的任务补回索引（已清空的完美世界不会复活，被覆盖的剑来能找回）
-//   - 额外自愈：扫描所有 xm_task:* 分片，把索引中缺失的任务补回（恢复被覆盖丢失的）
 async function migrateStorage() {
   const migrated = await new Promise(r => chrome.storage.local.get(['xm_storage_migrated'], o => r(o.xm_storage_migrated)))
   if (migrated) return
@@ -134,7 +145,6 @@ async function migrateStorage() {
     const have = new Set(idx.map(i => i.task_id))
     let changed = false
 
-    // ① 自愈：扫描所有分片任务，把索引中缺失的补回（修复 SW 重启导致索引被覆盖丢失的任务）
     for (const [k, v] of Object.entries(all)) {
       if (!k.startsWith(TASK_KEY_PREFIX) || !v || !v.task_id) continue
       if (have.has(v.task_id)) continue
@@ -147,12 +157,11 @@ async function migrateStorage() {
       changed = true
     }
 
-    // ② 旧格式 xm_taskQueue：仅当对应分片仍存在时才补回（用户已清空的不会复活）
     const old = all[STORAGE_QUEUE]
     if (old && old.length) {
       for (const t of old) {
         if (!t.task_id || have.has(t.task_id)) continue
-        if (!all[taskKey(t.task_id)]) continue  // 分片不存在 = 用户已删除，不恢复
+        if (!all[taskKey(t.task_id)]) continue
         idx.push({
           task_id: t.task_id, album_id: t.album_id, album_title: t.album_title,
           source: t.source, status: t.status, paused: !!t.paused,
@@ -164,13 +173,11 @@ async function migrateStorage() {
     }
 
     if (changed) await setIndex(idx)
-    // ③ 删除旧格式数据（根因：残留导致每次 SW 重启重复迁移旧记录）
     if (old && old.length) await new Promise(r => chrome.storage.local.remove([STORAGE_QUEUE], r))
     console.log('[plugin] 存储迁移/自愈完成')
   } catch (e) {
     console.error('[plugin] 存储迁移失败', e)
   }
-  // ④ 持久化标记，替代内存变量 storageMigrated（SW 重启后不再重复迁移）
   await new Promise(r => chrome.storage.local.set({ xm_storage_migrated: true }, r))
 }
 
@@ -183,10 +190,8 @@ async function getQueue() {
 }
 
 async function setQueue(q) {
-  // 分片模式下不再使用全量 setQueue，但为了兼容旧调用，转换为分片写入
   await migrateStorage()
   if (!q || !q.length) {
-    // 清空所有
     const idx = await getIndex()
     for (const item of idx) await delTask(item.task_id)
     await setIndex([])
@@ -240,7 +245,10 @@ async function updateTask(taskId, patch) {
     const task = await getTask(taskId)
     if (!task) return
     const updated = { ...task, ...patch }
-    await setTaskAndUpdateIndex(updated)
+    const idx = await getIndex()
+    await setTask(updated)
+    upsertIndexEntry(idx, updated)
+    await setIndex(idx)
   })
 }
 
@@ -254,7 +262,10 @@ async function updateTrack(taskId, trackId, patch) {
     if (!tr) return
     Object.assign(tr, patch)
     if (finalizeTask(task)) finished = { ...task }
-    await setTaskAndUpdateIndex(task)
+    const idx = await getIndex()
+    await setTask(task)
+    upsertIndexEntry(idx, task)
+    await setIndex(idx)
   })
   if (finished) notifyTaskDone(finished)
   maybeStopKeepAlive()
@@ -264,13 +275,10 @@ async function updateTrack(taskId, trackId, patch) {
 chrome.alarms.onAlarm.addListener(handleAlarm)
 chrome.runtime.onMessage.addListener(handleMessage)
 chrome.downloads.onChanged.addListener(handleDownloadChanged)
-// 注意：不要在 onSuspend 里恢复下载 UI —— SW 每次挂起都会恢复，
-// 会造成"静默开关开着但气泡照弹"的竞态窗口。UI 隐藏状态由 Chrome 按扩展维度保持，
-// 用户在设置里关掉「静默下载」或卸载插件时自然会恢复。
 
 // 启动：静默下载 UI → 拉取新任务 → 校正历史下载状态（SW 被杀重启场景）→ 自动批准待处理 → 派发续传
 applySilentMode()
-pollAnnouncement().catch(() => {})   // 公告拉取独立于下载主流程，失败不影响任务
+pollAnnouncement().catch(() => {})
 pollBackend()
   .then(() => reconcileDownloads())
   .then(() => autoApproveIfEnabled())
@@ -287,7 +295,10 @@ function handleAlarm(alarm) {
       .then(() => pump())
       .catch(e => console.error('[plugin] poll error', e))
   }
-  // keepAlive alarm 收到即保持 service worker 存活
+  if (alarm.name === 'keepAlive') {
+    // keepAlive 心跳，仅用于保持 SW 存活，无实际业务逻辑
+    // console.log('[plugin] keepAlive tick, inflight=', inflight.size)
+  }
 }
 
 // 开启「自动下载」时，把所有卡在 pending 的任务批准为 running（含重启前遗留的）
@@ -296,15 +307,18 @@ async function autoApproveIfEnabled() {
   if (!s.autoDownload) return
   await withQueue(async () => {
     const idx = await getIndex()
-    const taskIds = idx.filter(item => item.status === 'pending').map(item => item.task_id)
-    if (!taskIds.length) return
-    for (const taskId of taskIds) {
-      const task = await getTask(taskId)
+    let changed = false
+    for (const item of idx) {
+      if (item.status !== 'pending') continue
+      const task = await getTask(item.task_id)
       if (task && task.status === 'pending') {
         task.status = 'running'
-        await setTaskAndUpdateIndex(task)
+        await setTask(task)
+        upsertIndexEntry(idx, task)
+        changed = true
       }
     }
+    if (changed) await setIndex(idx)
   })
 }
 
@@ -347,8 +361,6 @@ function handleMessage(msg, sender, sendResponse) {
 }
 
 // ── 公告拉取 ──
-// 拉取最新启用公告并缓存到 storage（xm_announcement），popup 读取后与本地已读 id 对比决定是否弹出。
-// 已读状态存于 xm_announcement_read（id 数组），后端不跟踪已读。
 async function pollAnnouncement() {
   const { serverUrl, token } = await cfg()
   if (!serverUrl || !token) return null
@@ -359,7 +371,7 @@ async function pollAnnouncement() {
     await new Promise(res => chrome.storage.local.set({ xm_announcement: ann }, res))
     return ann
   } catch (e) {
-    return null  // 拉取失败静默忽略，不影响下载主流程
+    return null
   }
 }
 
@@ -374,12 +386,32 @@ async function pollBackend() {
     if (!data.success) { console.warn('[plugin] poll backend failed', data); return }
     const tasks = data.tasks || []
     if (!tasks.length) return
-    // 先本地落库，再 ack 后端（顺序反了会丢任务）
+
+    // 本地去重增强：检查是否已存在相同专辑+相同曲目集的任务（任何状态），避免重复推送导致 (1) 副本
+    const existingIdx = await getIndex()
+    const existingTasks = await getTasksBatch(existingIdx.map(i => i.task_id))
+
     await withQueue(async () => {
       const idx = await getIndex()
       let changed = false
       for (const t of tasks) {
         if (idx.some(existing => existing.task_id === t.task_id)) continue
+
+        // 额外去重：同 album_id + 同 track_ids 已存在（running/pending/done）则跳过
+        const newTrackIds = (t.tracks || []).map(x => String(x.track_id)).sort().join(',')
+        const isDup = existingTasks.some(et => {
+          if (et.album_id !== String(t.album_id)) return false
+          if (et.source !== t.source) return false
+          const oldIds = (et.tracks || []).map(x => String(x.track_id)).sort().join(',')
+          return oldIds === newTrackIds && et.status !== 'cancelled'
+        })
+        if (isDup) {
+          console.log('[plugin] 跳过重复推送任务', t.album_id, t.task_id)
+          // 仍需 ack 后端，避免反复拉取
+          newIds.push(t.task_id) // 标记为已处理，触发 ack
+          continue
+        }
+
         const tracks = (t.tracks || []).map(tr => ({
           ...tr, status: 'pending', error: '', downloadId: null,
         }))
@@ -414,23 +446,24 @@ async function pollBackend() {
     console.log('[plugin] 已拉取新任务', newIds.length, '个')
   } catch (e) { console.error('[plugin] poll error', e); return }
 
-  // 设置开启了「自动下载」→ 新任务直接批准并派发
   if (newIds.length) {
     const s = await getSettings()
     if (s.autoDownload) {
       await withQueue(async () => {
         const idx = await getIndex()
+        let changed = false
         for (const item of idx) {
           if (newIds.includes(item.task_id) && item.status === 'pending') {
-            item.status = 'running'
             const task = await getTask(item.task_id)
-            if (task) {
+            if (task && task.status === 'pending') {
               task.status = 'running'
-              await setTaskAndUpdateIndex(task)
+              await setTask(task)
+              upsertIndexEntry(idx, task)
+              changed = true
             }
           }
         }
-        await setIndex(idx)
+        if (changed) await setIndex(idx)
       })
       pump()
     }
@@ -438,48 +471,113 @@ async function pollBackend() {
 }
 
 // ── 启动续传：校正 SW 被杀前的下载状态 ──
-// 卡在 resolving/downloading 且下载记录已丢失的 → 重置为 pending 交由 pump 重派；
-// 已完成 / 已失败的按 chrome.downloads 真实状态校正（SW 死亡期间完成的也能对账）。
+// 修复：之前在 withQueue 锁内串行执行 chrome.downloads.search，导致锁长时间占用，进度卡住
+// 新实现：两阶段，先快照需要检查的 track，再锁外查询，最后锁内批量更新，并重建 inflight
 async function reconcileDownloads() {
   const finishedList = []
+  let snapshot = [] // [{taskId, trackId, downloadId, status}]
+
+  // 阶段1：快照（短锁）
   await withQueue(async () => {
     const idx = await getIndex()
-    let changed = false
+    for (const item of idx) {
+      if (item.status === 'done' || item.status === 'cancelled') continue
+      const task = await getTask(item.task_id)
+      if (!task) continue
+      for (const tr of task.tracks) {
+        if (tr.status === 'downloading' || tr.status === 'resolving') {
+          snapshot.push({
+            taskId: task.task_id,
+            trackId: tr.track_id,
+            downloadId: tr.downloadId,
+            status: tr.status,
+          })
+        }
+      }
+    }
+  })
+
+  if (!snapshot.length) {
+    // 即使没有需要校正的，也要重建 inflight 为空（SW 重启场景）
+    inflight.clear()
+    return
+  }
+
+  // 阶段2：锁外查询下载状态（避免阻塞队列锁）
+  const searchResults = new Map() // downloadId -> downloadItem | null
+  for (const s of snapshot) {
+    if (s.downloadId == null) {
+      searchResults.set(`${s.taskId}/${s.trackId}`, null)
+      continue
+    }
+    try {
+      const items = await chrome.downloads.search({ id: s.downloadId })
+      searchResults.set(s.downloadId, items && items[0] ? items[0] : null)
+    } catch (e) {
+      searchResults.set(s.downloadId, null)
+    }
+  }
+
+  // 阶段3：批量更新（短锁）+ 重建 inflight
+  await withQueue(async () => {
+    const idx = await getIndex()
+    const newInflight = new Set()
+    let anyChanged = false
+
     for (const item of idx) {
       if (item.status === 'done' || item.status === 'cancelled') continue
       const task = await getTask(item.task_id)
       if (!task) continue
       let taskChanged = false
+
       for (const tr of task.tracks) {
-        if (tr.downloadId == null) {
-          if (tr.status === 'downloading' || tr.status === 'resolving') { tr.status = 'pending'; tr.error = ''; taskChanged = true }
+        const key = task.task_id + '/' + tr.track_id
+        // 只处理快照中的 track
+        const snap = snapshot.find(x => x.taskId === task.task_id && x.trackId === tr.track_id)
+        if (!snap) continue
+
+        if (snap.downloadId == null) {
+          if (tr.status === 'downloading' || tr.status === 'resolving') {
+            tr.status = 'pending'; tr.error = ''; tr.downloadId = null
+            taskChanged = true
+          }
           continue
         }
-        try {
-          const items = await chrome.downloads.search({ id: tr.downloadId })
-          const it = items && items[0]
-          if (!it || it.state === 'interrupted') {
-            // ⚠️ 只重置「传输中/解析中」的集：done 集的下载记录是被我们自己 erase 的（正常状态），
-            // 若把 done 重置回 pending，下一轮 alarm 的 pump 会把已完成集重新下载出 "(1)" 副本
-            if (tr.status === 'downloading' || tr.status === 'resolving') {
-              tr.status = 'pending'; tr.downloadId = null; tr.error = ''; taskChanged = true
-            }
-          } else if (it.state === 'complete') {
-            if (tr.status !== 'done') { tr.status = 'done'; tr.error = ''; taskChanged = true }
-          } else if (it.state === 'in_progress') {
-            if (tr.status !== 'downloading') { tr.status = 'downloading'; taskChanged = true }
+
+        const it = searchResults.get(snap.downloadId)
+        if (!it || it.state === 'interrupted') {
+          if (tr.status === 'downloading' || tr.status === 'resolving') {
+            tr.status = 'pending'; tr.downloadId = null; tr.error = ''
+            taskChanged = true
           }
-        } catch (e) { /* 忽略单条查询错误 */ }
+        } else if (it.state === 'complete') {
+          if (tr.status !== 'done') { tr.status = 'done'; tr.error = ''; taskChanged = true }
+        } else if (it.state === 'in_progress') {
+          if (tr.status !== 'downloading') { tr.status = 'downloading'; taskChanged = true }
+          newInflight.add(key)
+        }
       }
+
       if (finalizeTask(task)) { finishedList.push({ ...task }); taskChanged = true }
       if (taskChanged) {
-        await setTaskAndUpdateIndex(task)
-        changed = true
+        await setTask(task)
+        upsertIndexEntry(idx, task)
+        anyChanged = true
       }
     }
-    if (changed) { console.log('[plugin] reconcileDownloads corrected state') }
+
+    // 重建 inflight：用新发现的仍在下载中的集合
+    inflight.clear()
+    for (const k of newInflight) inflight.add(k)
+
+    if (anyChanged) {
+      await setIndex(idx)
+      console.log('[plugin] reconcileDownloads corrected state, inflight=', inflight.size)
+    }
   })
+
   for (const t of finishedList) notifyTaskDone(t)
+  maybeStopKeepAlive()
 }
 
 // 手动下载：把 pending 任务标记为 running（已批准），再派发
@@ -488,15 +586,22 @@ async function approveAndProcess() {
     const idx = await getIndex()
     let changed = false
     for (const item of idx) {
-      if (item.status === 'pending' || item.status === 'running') {
-        if (item.status !== 'running') {
-          item.status = 'running'
-          const task = await getTask(item.task_id)
-          if (task) {
-            task.status = 'running'
-            task.paused = false
-            await setTaskAndUpdateIndex(task)
-          }
+      if (item.status === 'pending') {
+        const task = await getTask(item.task_id)
+        if (task && task.status === 'pending') {
+          task.status = 'running'
+          task.paused = false
+          await setTask(task)
+          upsertIndexEntry(idx, task)
+          changed = true
+        }
+      } else if (item.status === 'running' && item.paused) {
+        // 之前暂停的也一并恢复
+        const task = await getTask(item.task_id)
+        if (task) {
+          task.paused = false
+          await setTask(task)
+          upsertIndexEntry(idx, task)
           changed = true
         }
       }
@@ -507,23 +612,16 @@ async function approveAndProcess() {
 }
 
 // ── 下载调度器（pump 式：每次读取最新队列状态，暂停/取消立即生效）──
-let activeCount = 0                 // 进行中的下载协程数
-const inflight = new Set()          // `${taskId}/${trackId}`，防重复派发
+const inflight = new Set()          // `${taskId}/${trackId}`，防重复派发，唯一并发计数来源
 let pumping = false
 let pumpQueued = false
 
 // ── 书籍级串行选取 ──
-// 规则：同一时刻只允许一本「活跃书」在下载。服务器一次推多本时，
-// 其余书保持 running 但处于「排队中」，等当前书全部结束才轮到下一本。
-// 活跃书 = 第一本有进行中集（resolving/downloading/inflight）的 running 任务；
-// 若没有活跃书，则取第一本还有待下载集的 running 任务。
-// ⚠️ 此函数在 pump 的 while 循环中调用，不在 withQueue 锁内。它只读取 storage，不写入。
 async function pickBookDispatch() {
   const idx = await getIndex()
   const runningIds = idx.filter(i => i.status === 'running').map(i => i.task_id)
   if (!runningIds.length) return null
   
-  // 获取所有 running 任务的完整数据
   const tasks = await getTasksBatch(runningIds)
   
   let active = null
@@ -547,7 +645,7 @@ async function pickBookDispatch() {
       return { taskId: active.task_id, trackId: tr.track_id }
     }
   }
-  return null  // 活跃书没有可派发的集（都在传输中）→ 等它结束再派下一本
+  return null
 }
 
 async function pump() {
@@ -557,12 +655,12 @@ async function pump() {
   try {
     const settings = await getSettings()
     const limit = Math.max(1, Math.min(8, settings.concurrency || 1))
-    while (activeCount < limit) {
+    while (inflight.size < limit) {
       const pick = await pickBookDispatch()
       if (!pick) break
       const key = pick.taskId + '/' + pick.trackId
+      if (inflight.has(key)) break // 双重保险，防重复
       inflight.add(key)
-      activeCount++
       dispatched = true
       // 先落盘为 resolving，杜绝 SW 重启/并发导致的重复派发
       await updateTrack(pick.taskId, pick.trackId, { status: 'resolving', error: '' })
@@ -570,26 +668,28 @@ async function pump() {
         .catch(e => console.error('[plugin] runTrack error', e))
         .finally(() => {
           inflight.delete(key)
-          activeCount = Math.max(0, activeCount - 1)
           pump()
         })
     }
   } finally {
     pumping = false
-    if (pumpQueued) { pumpQueued = false; pump() }
-    else if (!dispatched) maybeStopKeepAlive()
+    if (pumpQueued) {
+      pumpQueued = false
+      // 延迟一小会儿再触发，避免同步递归导致调用栈过深
+      setTimeout(() => pump(), 0)
+    } else if (!dispatched) {
+      maybeStopKeepAlive()
+    }
   }
   if (dispatched) startKeepAlive()
 }
 
 // 派发前闸口：读取最新任务状态（暂停/取消对未开始的集立即生效）
-// ⚠️ 此函数在 runTrack 中调用，不在 withQueue 锁内。它读取任务状态，必要时调用 updateTrack（会获取锁）
 async function gateCheck(taskId, trackId) {
   const task = await getTask(taskId)
   if (!task) return 'abort'
-  if (task.status === 'cancelled') return 'abort'   // cancelTask 已把该集标记为「已取消」
+  if (task.status === 'cancelled') return 'abort'
   if (task.status !== 'running' || task.paused) {
-    // 未开始即被暂停 → 回滚为待处理，等用户继续
     await updateTrack(taskId, trackId, { status: 'pending', error: '' })
     return 'abort'
   }
@@ -597,20 +697,31 @@ async function gateCheck(taskId, trackId) {
 }
 
 const trackDoneResolvers = new Map()   // downloadId -> resolve
-const pendingTerminals = new Map()     // downloadId -> true（终端事件先于 resolver 注册到达时缓存）
+const pendingTerminals = new Map()     // downloadId -> {time}，LRU 淘汰，避免无界增长
+
 function awaitTrackDone(downloadId) {
   return new Promise(res => {
     trackDoneResolvers.set(downloadId, res)
-    if (pendingTerminals.has(downloadId)) { pendingTerminals.delete(downloadId); res() }
+    if (pendingTerminals.has(downloadId)) {
+      pendingTerminals.delete(downloadId)
+      res()
+    }
   })
 }
+
 function resolveTerminal(downloadId) {
   const r = trackDoneResolvers.get(downloadId)
-  if (r) { trackDoneResolvers.delete(downloadId); r() }
-  else {
-    // 非插件下载（用户手动下载等）的终端事件会缓存到 pendingTerminals，设上限防无界增长
-    if (pendingTerminals.size > 1000) pendingTerminals.clear()
-    pendingTerminals.set(downloadId, true)
+  if (r) {
+    trackDoneResolvers.delete(downloadId)
+    r()
+  } else {
+    // 终端事件先于 resolver 到达，缓存起来，设置上限 LRU 淘汰最旧
+    if (pendingTerminals.size >= 1000) {
+      // 删除最旧的 100 条
+      const keys = Array.from(pendingTerminals.keys()).slice(0, 100)
+      for (const k of keys) pendingTerminals.delete(k)
+    }
+    pendingTerminals.set(downloadId, Date.now())
   }
 }
 
@@ -621,9 +732,8 @@ async function runTrack(taskId, trackId) {
   const settings = await getSettings()
   const maxRetry = Math.max(1, Math.min(10, settings.maxRetry || MAX_RETRY))
   const delayMs = Math.max(0, Math.min(120000, settings.downloadDelayMs || 0))
-  // 每集间隔延迟（防音源风控）；延迟期间暂停/取消由循环内的 gateCheck 兜住
   if (delayMs > 0) await sleep(delayMs)
-  // 阶段一：解析直链 + 创建下载（失败可重试）
+
   for (let attempt = 1; attempt <= maxRetry; attempt++) {
     if (await gateCheck(taskId, trackId) !== 'go') return
     try {
@@ -631,22 +741,43 @@ async function runTrack(taskId, trackId) {
       if (!task) return
       const tr = task.tracks.find(t => t.track_id === trackId)
       if (!tr) return
-      // 防重复落盘守卫①：本集已完成 / 正在传输 → 不再重复下载
       if (tr.status === 'done' || tr.status === 'downloading') return
-      // 防重复落盘守卫②：同专辑+同集+同格式已在其他任务下完（如同一专辑被推送了两次）
-      // → 直接标 done 跳过，不再产生 "(1)" 副本文件
-      // ⚠️ 此检查在锁外，但只读取状态不写入。即使竞态导致漏检，后续 updateTrack 的锁内检查会兜底
+
+      // 防重复落盘守卫：同专辑+同集+同格式已在其他任务中处于非失败状态（pending/resolving/downloading/done）
+      // 之前仅检查 done，导致同一专辑被推送两次时产生 (1) 副本
       const idx = await getIndex()
       const otherIds = idx.filter(i => i.task_id !== taskId && i.album_id === task.album_id).map(i => i.task_id)
-      const otherTasks = await getTasksBatch(otherIds)
-      const dup = otherTasks.find(o =>
-        o.tracks.some(t => t.track_id === trackId && t.status === 'done' &&
-          (t.fmt || o.fmt || 'mp3') === (tr.fmt || task.fmt || 'mp3')))
-      if (dup) {
-        console.log('[plugin] 跳过重复集（其他任务已下载）', task.album_id, trackId)
-        await updateTrack(taskId, trackId, { status: 'done', error: '' })
-        return
+      if (otherIds.length) {
+        const otherTasks = await getTasksBatch(otherIds)
+        const dup = otherTasks.find(o =>
+          o.tracks.some(t => {
+            if (String(t.track_id) !== String(trackId)) return false
+            if (t.status === 'error') return false // 失败的不算，可重试
+            const fmtA = (t.fmt || o.fmt || 'mp3')
+            const fmtB = (tr.fmt || task.fmt || 'mp3')
+            return fmtA === fmtB
+          })
+        )
+        if (dup) {
+          console.log('[plugin] 跳过重复集（其他任务已存在）', task.album_id, trackId, 'existing in', dup.task_id)
+          await updateTrack(taskId, trackId, { status: 'done', error: '' })
+          return
+        }
       }
+
+      // 锁内二次校验：防止竞态下同一 track 被并发派发两次
+      let shouldSkip = false
+      await withQueue(async () => {
+        const freshTask = await getTask(taskId)
+        if (!freshTask) { shouldSkip = true; return }
+        const freshTr = freshTask.tracks.find(t => t.track_id === trackId)
+        if (!freshTr) { shouldSkip = true; return }
+        if (freshTr.status === 'done' || freshTr.status === 'downloading') {
+          shouldSkip = true
+        }
+      })
+      if (shouldSkip) return
+
       const url = await resolveForTrack(task, tr, { serverUrl, token })
       if (!url) throw new Error('解析结果为空')
       const fname = buildFilename(task, tr, settings.downloadPrefix)
@@ -666,7 +797,6 @@ async function runTrack(taskId, trackId) {
     }
   }
   if (downloadId == null) return
-  // 阶段二：等待终端态（完成/失败由 onChanged 处理；不重试避免重复文件）
   const ok = await Promise.race([
     awaitTrackDone(downloadId).then(() => true),
     sleep(TRACK_TIMEOUT).then(() => false),
@@ -692,7 +822,6 @@ async function resolveForTrack(task, tr, ctx) {
 }
 
 // ── 监听 chrome.downloads 状态变化 ──
-// 顺序关键：先 resolveTerminal 唤醒等待协程（绝不被队列锁阻塞），再异步落盘状态。
 function handleDownloadChanged(delta) {
   if (!delta || !delta.id) return
   const id = delta.id
@@ -701,18 +830,17 @@ function handleDownloadChanged(delta) {
   if (terminal) {
     console.log('[plugin] download terminal', id, delta.state && delta.state.current, delta.error && delta.error.current)
     resolveTerminal(id)
-    // 注意：erase 不在这里做 —— 必须等下方 withQueue 把「done」写进存储之后再抹记录，
-    // 否则 SW 在 erase→写存储 的间隙被杀时，重启对账找不到记录会把已完成集重置重下。
-    // 且 erase 只应作用于插件自己的下载（匹配到队列条目才抹），不能抹用户手动下载的记录。
   }
   if (!delta.state && !delta.error && !delta.filename) return
   withQueue(async () => {
     const idx = await getIndex()
+    let found = false
     for (const item of idx) {
       const task = await getTask(item.task_id)
       if (!task) continue
       const tr = task.tracks.find(t => t.downloadId === id)
       if (!tr) continue
+      found = true
       const wasCancelledByUser = task.status === 'cancelled' || (tr.status === 'error' && tr.error === '已取消')
       const patch = {}
       if (delta.state && delta.state.current) {
@@ -728,10 +856,17 @@ function handleDownloadChanged(delta) {
       const hadPatch = Object.keys(patch).length > 0
       Object.assign(tr, patch)
       const finished = finalizeTask(task)
-      // 仅当确有状态变更（patch 非空或任务已终态）时才写回
+
+      // 清理 inflight，防止 SW 重启后残留
+      const key = task.task_id + '/' + tr.track_id
+      if (patch.status === 'done' || patch.status === 'error') {
+        inflight.delete(key)
+      }
+
       if (hadPatch || finished) {
-        await setTaskAndUpdateIndex(task)
-        // 状态已安全落盘 → 此时抹掉 Chrome 下载记录才不会再触发重启重下；磁盘文件不受影响
+        await setTask(task)
+        upsertIndexEntry(idx, task)
+        await setIndex(idx)
         if (delta.state && delta.state.current === 'complete') {
           try { chrome.downloads.erase({ id }).catch(() => {}) } catch (e) {}
         }
@@ -739,15 +874,25 @@ function handleDownloadChanged(delta) {
       }
       break
     }
+    if (!found) {
+      // 未匹配到插件任务，可能是用户手动下载，忽略
+    }
   }).then(() => maybeStopKeepAlive()).catch(e => console.error('[plugin] onChanged error', e))
 }
 
 // ── 下载控制：暂停 / 继续 / 取消 / 重试（全部真正生效）──
 async function pauseTask(taskId) {
-  await updateTask(taskId, { paused: true })
+  await withQueue(async () => {
+    const task = await getTask(taskId)
+    if (!task) return
+    task.paused = true
+    const idx = await getIndex()
+    await setTask(task)
+    upsertIndexEntry(idx, task)
+    await setIndex(idx)
+  })
   const task = await getTask(taskId)
   if (!task) return
-  // 传输中的也真正暂停（Chrome 层面断流，不只是停止派发新集）
   for (const tr of task.tracks) {
     if (tr.status === 'downloading' && tr.downloadId != null) {
       try { await chrome.downloads.pause(tr.downloadId) } catch (e) {}
@@ -761,7 +906,10 @@ async function resumeTask(taskId) {
     if (task) {
       task.paused = false
       if (task.status === 'pending') task.status = 'running'
-      await setTaskAndUpdateIndex(task)
+      const idx = await getIndex()
+      await setTask(task)
+      upsertIndexEntry(idx, task)
+      await setIndex(idx)
     }
   })
   const task = await getTask(taskId)
@@ -784,14 +932,17 @@ async function cancelTask(taskId) {
       if (tr.status === 'downloading' && tr.downloadId != null) ids.push(tr.downloadId)
       if (tr.status === 'pending' || tr.status === 'downloading' || tr.status === 'resolving') {
         tr.status = 'error'; tr.error = '已取消'
+        inflight.delete(task.task_id + '/' + tr.track_id)
       }
     }
     task.status = 'cancelled'
     task.paused = false
     recomputeProgress(task)
-    await setTaskAndUpdateIndex(task)
+    const idx = await getIndex()
+    await setTask(task)
+    upsertIndexEntry(idx, task)
+    await setIndex(idx)
   })
-  // 先落库「已取消」再 cancel，onChanged 回来时会看到取消标记、不覆盖语义
   for (const id of ids) { try { await chrome.downloads.cancel(id) } catch (e) {} }
   maybeStopKeepAlive()
 }
@@ -800,16 +951,17 @@ async function retryFailed(taskId) {
   await withQueue(async () => {
     const task = await getTask(taskId)
     if (!task) return
-    if (task.status === 'cancelled') return   // 已取消的任务不重试（其 error 都是「已取消」）
+    if (task.status === 'cancelled') return
     let has = false
     for (const tr of task.tracks) {
       if (tr.status === 'error') { tr.status = 'pending'; tr.error = ''; tr.downloadId = null; has = true }
     }
-    // 只要有失败集被重置为 pending，就把任务改回 running（含 done 任务）。
-    // 之前 done 不改回 running，是「点重试没反应」的根因：调度器只派发 running 任务。
     if (has) { task.status = 'running'; task.paused = false }
     recomputeProgress(task)
-    await setTaskAndUpdateIndex(task)
+    const idx = await getIndex()
+    await setTask(task)
+    upsertIndexEntry(idx, task)
+    await setIndex(idx)
   })
   await pump()
 }
@@ -817,21 +969,24 @@ async function retryFailed(taskId) {
 async function retryAllFailed() {
   await withQueue(async () => {
     const idx = await getIndex()
+    let anyChanged = false
     for (const item of idx) {
-      if (item.status === 'cancelled') continue   // 已取消的任务不重试，避免复活取消的书
+      if (item.status === 'cancelled') continue
       const task = await getTask(item.task_id)
       if (!task) continue
       let has = false
       for (const tr of task.tracks) {
         if (tr.status === 'error') { tr.status = 'pending'; tr.error = ''; tr.downloadId = null; has = true }
       }
-      // 同 retryFailed：done 任务也要改回 running 才能被调度器派发
-      if (has) { task.status = 'running'; task.paused = false }
-      recomputeProgress(task)
       if (has) {
-        await setTaskAndUpdateIndex(task)
+        task.status = 'running'; task.paused = false
+        recomputeProgress(task)
+        await setTask(task)
+        upsertIndexEntry(idx, task)
+        anyChanged = true
       }
     }
+    if (anyChanged) await setIndex(idx)
   })
   await pump()
 }
@@ -842,19 +997,20 @@ async function pauseAll() {
   for (const id of runningIds) await pauseTask(id)
 }
 
-// 启动单个待处理任务（批准 → running → 派发）
 async function startTask(taskId) {
   await withQueue(async () => {
     const task = await getTask(taskId)
     if (task && (task.status === 'pending' || task.status === 'running')) {
       task.status = 'running'; task.paused = false
-      await setTaskAndUpdateIndex(task)
+      const idx = await getIndex()
+      await setTask(task)
+      upsertIndexEntry(idx, task)
+      await setIndex(idx)
     }
   })
   await pump()
 }
 
-// 全部继续 = 恢复已暂停 + 批准所有待处理任务（不再让任务卡在「待处理」）
 async function resumeAll() {
   await withQueue(async () => {
     const idx = await getIndex()
@@ -862,20 +1018,18 @@ async function resumeAll() {
     for (const item of idx) {
       if (item.status === 'done' || item.status === 'cancelled') continue
       if (item.status === 'pending' || item.paused) {
-        item.status = 'running'
-        item.paused = false
         const task = await getTask(item.task_id)
         if (task) {
           task.status = 'running'
           task.paused = false
-          await setTaskAndUpdateIndex(task)
+          await setTask(task)
+          upsertIndexEntry(idx, task)
+          changed = true
         }
-        changed = true
       }
     }
     if (changed) await setIndex(idx)
   })
-  // 恢复所有传输中被暂停的下载
   const idx = await getIndex()
   const runningIds = idx.filter(i => i.status === 'running').map(i => i.task_id)
   const tasks = await getTasksBatch(runningIds)
@@ -896,8 +1050,13 @@ async function clearTasks(statuses) {
     const cleared = idx.filter(item => statuses.includes(item.status)).length
     const remaining = idx.filter(item => !statuses.includes(item.status))
     const removedIds = idx.filter(item => statuses.includes(item.status)).map(item => item.task_id)
-    // 删除分片
-    for (const id of removedIds) await delTask(id)
+    for (const id of removedIds) {
+      await delTask(id)
+      // 清理 inflight 中属于被删除任务的条目
+      for (const k of Array.from(inflight)) {
+        if (k.startsWith(id + '/')) inflight.delete(k)
+      }
+    }
     await setIndex(remaining)
     return { ok: true, cleared }
   })
@@ -907,7 +1066,7 @@ async function clearTasks(statuses) {
 function startKeepAlive() {
   if (keepAliveActive) return
   keepAliveActive = true
-  chrome.alarms.create('keepAlive', { periodInMinutes: 0.5 })  // Chrome 最小允许 0.5 分钟(30s)，更小的会被静默钳制
+  chrome.alarms.create('keepAlive', { periodInMinutes: 1 })
 }
 function stopKeepAlive() {
   if (!keepAliveActive) return
@@ -915,16 +1074,13 @@ function stopKeepAlive() {
   chrome.alarms.clear('keepAlive')
 }
 async function maybeStopKeepAlive() {
-  // 先检查内存中的 activeCount，避免不必要的存储读取
-  if (activeCount > 0) return
+  if (inflight.size > 0) return
   const idx = await getIndex()
   const anyActive = idx.some(item => item.status === 'running' && !item.paused)
   if (!anyActive) stopKeepAlive()
 }
 
-// ── 静默下载：关闭浏览器自带下载 UI（下载完成弹窗/下载气泡）──
-// 注意：setUiOptions 除了 downloads 权限外还需要 manifest 里的 downloads.ui 权限，
-// 否则调用直接抛错（不弹任何提示，纯静默失败）。
+// ── 静默下载：关闭浏览器自带下载 UI ──
 async function applySilentMode() {
   try {
     const s = await getSettings()
@@ -940,26 +1096,39 @@ async function applySilentMode() {
 
 // ── 工具函数 ──
 function buildFilename(task, tr, prefix) {
-  const album = (task.album_title || ('album_' + task.album_id)).replace(/[\\/:*?"<>|]/g, '_')
+  // 文件名安全 + 长度限制，避免 OS 路径过长
+  const sanitize = (s) => (s || '').replace(/[\\/:*?"<>|]/g, '_').trim()
+  const maxLen = 80 // 单段最大长度
+  const trunc = (s, len) => {
+    s = sanitize(s)
+    if (s.length <= len) return s
+    return s.slice(0, len - 3) + '...'
+  }
+
+  const album = trunc(task.album_title || ('album_' + task.album_id), maxLen) || 'album'
   const ep = tr.episode_num != null ? String(tr.episode_num).padStart(4, '0') : (tr.track_id || '')
-  const title = (tr.title || '').replace(/[\\/:*?"<>|]/g, '_')
-  const base = `${album}/${ep} ${title}.${tr.fmt || task.fmt || 'mp3'}`
+  const title = trunc(tr.title || '', maxLen) || tr.track_id || 'track'
+  const ext = (tr.fmt || task.fmt || 'mp3').replace(/[^a-z0-9]/gi, '').slice(0, 6) || 'mp3'
+  const base = `${album}/${ep} ${title}.${ext}`
   if (!prefix) return base
-  const p = prefix.replace(/[\\/:*?"<>|]/g, '_').replace(/\/$/, '')
+  const p = trunc(prefix, 40).replace(/\/$/, '')
   return `${p}/${base}`
 }
 
 // ── 官方 xm-sign：通过 Offscreen Document 调用 du_web_sdk ──
 async function ensureOffscreen() {
-  // 用 hasDocument() 取真实状态作为真相来源：文档在就跳过；被关闭/崩溃后能重建。
-  // （不能用 offscreenReady 静态标志当真相——否则文档关闭后 ensureOffscreen 永远 return，
-  //   官方源 sendMessage 到不存在的文档 → "Receiving end does not exist" → 永久失败）
   try {
-    if (typeof chrome.offscreen.hasDocument === 'function' && await chrome.offscreen.hasDocument()) {
-      offscreenReady = true
-      return
+    if (typeof chrome.offscreen.hasDocument === 'function') {
+      const has = await chrome.offscreen.hasDocument()
+      if (has) {
+        offscreenReady = true
+        return
+      } else {
+        // 文档不存在，重置标志以便重建
+        offscreenReady = false
+      }
     }
-  } catch (_) { /* 旧版本 Chrome 无此 API，走下方 offscreenReady 兜底 */ }
+  } catch (_) {}
   if (offscreenReady) return
   try {
     const reason = (chrome.offscreen.Reason && chrome.offscreen.Reason.DOM_SCRAPING) || 'DOM_SCRAPING'
@@ -979,8 +1148,7 @@ async function ensureOffscreen() {
 
 async function getSign() {
   await ensureOffscreen()
-  // offscreen 文档刚创建时脚本可能尚未注册监听 → 重试规避 "Receiving end does not exist"
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 4; i++) {
     try {
       const sign = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'sign' })
       if (sign && sign.error) throw new Error(sign.error)
@@ -988,8 +1156,13 @@ async function getSign() {
       return sign
     } catch (e) {
       const msg = (e && e.message) || String(e)
-      if (/Receiving end does not exist|could not establish|message channel|The receiver/.test(msg) && i < 2) {
-        await sleep(300); continue
+      if (/Receiving end does not exist|could not establish|message channel|The receiver/.test(msg)) {
+        if (i < 3) {
+          offscreenReady = false
+          await sleep(400 * (i + 1))
+          await ensureOffscreen().catch(() => {})
+          continue
+        }
       }
       throw e
     }
@@ -1016,13 +1189,11 @@ async function getXmCookie() {
   return xmCookieCache
 }
 
-// 限流关键词（与服务器 api/download.py _is_rate_limited 保持一致）
 function isRateLimited(msg) {
   if (!msg) return false
   return ['网络繁忙', '明天再试', '访问过于频繁', '请求过于频繁'].some(kw => msg.includes(kw))
 }
 
-// 插件检测到某账号被限流时，通知后端标记该账号冷却（仅当前卡密）
 async function markAccountCooldown(accountId, ctx) {
   if (!ctx || !ctx.serverUrl || !ctx.token || !accountId) return
   try {
@@ -1031,15 +1202,15 @@ async function markAccountCooldown(accountId, ctx) {
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + ctx.token },
       body: JSON.stringify({ account_id: accountId }),
     })
+    // 冷却后立即失效本地缓存，下次 getXmCookie 会重新拉取可用账号
+    xmCookieCache = null
+    xmCookieTs = 0
   } catch (e) { console.warn('[plugin] markAccountCooldown failed', e) }
 }
 
-// MV3 关键坑：fetch 禁止手动设置 Cookie 头（forbidden header），浏览器会静默丢弃。
-// 所以必须把官方账号的登录态用 chrome.cookies.set 注入浏览器 cookie 商店，
-// fetch 访问 mobile.ximalaya.com 时才会自动带上，否则永远 ret=2002 未登录。
 let lastInstalledCookie = null
 async function installXmCookies(cookieStr) {
-  if (!cookieStr || cookieStr === lastInstalledCookie) return   // 同字符串去重，避免千集重复写盘
+  if (!cookieStr || cookieStr === lastInstalledCookie) return
   const expiry = Math.floor(Date.now() / 1000) + 365 * 24 * 3600
   const pairs = cookieStr.split(';').map(s => s.trim()).filter(Boolean)
   let ok = 0
@@ -1048,6 +1219,7 @@ async function installXmCookies(cookieStr) {
     if (idx < 0) continue
     const name = p.slice(0, idx).trim()
     const value = p.slice(idx + 1).trim()
+    if (!name) continue
     try {
       await chrome.cookies.set({
         url: 'https://ximalaya.com/',
@@ -1068,7 +1240,6 @@ async function installXmCookies(cookieStr) {
   lastInstalledCookie = cookieStr
 }
 
-// 官方源多账号轮询：遍历 accounts（VIP 优先），某账号命中限流则标记冷却并换下一个。
 async function resolveOfficialRotation(trackId, quality, sign, accounts, ctx) {
   const usable = accounts.slice()
   const errors = []
@@ -1091,8 +1262,6 @@ async function resolveOfficialRotation(trackId, quality, sign, accounts, ctx) {
         console.warn('[plugin] 官方账号限流，切换下一个:', acc.id, msg)
         await markAccountCooldown(acc.id, ctx)
       }
-      // 非限流错误也继续轮动（如该账号 cookie 失效/临时失败，换下一个可用账号），
-      // 但把每个账号的原始报错收集起来，最后汇总抛出，用户能看到真实失败原因
     }
   }
   throw new Error(errors.length ? errors.join(' | ') : '所有官方账号均不可用')

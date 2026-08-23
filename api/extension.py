@@ -71,24 +71,50 @@ async def create_local_task(req: CreateTaskRequest, auth: dict = Depends(get_cur
             if pending >= _MAX_PENDING_PER_CARD:
                 raise HTTPException(status_code=429, detail="待下载任务过多，请先在插件中完成已有任务")
 
-            # 幂等去重：同卡密+同接口+同专辑 且有待处理任务的曲目集完全一致 → 视为重复推送，
-            # 直接返回原任务，避免插件侧同集重复下载产生 "(1)" 副本文件
-            new_ids = sorted(x.track_id for x in tracks)
-            for t in db.query(LocalTask).filter_by(
-                card_id=card_id, source=req.source, album_id=str(req.album_id), status="pending"
-            ):
+            # 幂等去重增强：
+            # 原逻辑仅检查 pending，ack 后任务变为 done，短时间内重复推送会产生新任务，导致插件侧重复下载 (1) 副本
+            # 新逻辑：同卡密+同接口+同专辑 且曲目集完全一致，且状态非 cancelled，且在 30 分钟内 → 视为重复
+            new_ids = sorted(str(x.track_id) for x in tracks)
+            candidates = (
+                db.query(LocalTask)
+                .filter_by(card_id=card_id, source=req.source, album_id=str(req.album_id))
+                .filter(LocalTask.status != "cancelled")
+                .order_by(LocalTask.created_at.desc())
+                .limit(20)
+                .all()
+            )
+            for t in candidates:
                 try:
                     old_ids = sorted(str(x.get("track_id")) for x in json.loads(t.tracks or "[]"))
                 except Exception:  # noqa: BLE001
                     continue
                 if old_ids == new_ids:
-                    return {
-                        "success": True,
-                        "task_id": t.task_id,
-                        "count": len(new_ids),
-                        "duplicated": True,
-                        "message": "相同任务已在插件队列中，无需重复推送",
-                    }
+                    if t.status == "pending":
+                        return {
+                            "success": True,
+                            "task_id": t.task_id,
+                            "count": len(new_ids),
+                            "duplicated": True,
+                            "message": "相同任务已在插件队列中，无需重复推送",
+                        }
+                    # done 任务在 30 分钟内也去重，避免快速双击产生重复
+                    if t.status == "done" and t.created_at:
+                        try:
+                            now = datetime.now(timezone.utc)
+                            created = t.created_at
+                            if created.tzinfo is None:
+                                created = created.replace(tzinfo=timezone.utc)
+                            age = (now - created).total_seconds()
+                            if age < 30 * 60:
+                                return {
+                                    "success": True,
+                                    "task_id": t.task_id,
+                                    "count": len(new_ids),
+                                    "duplicated": True,
+                                    "message": "相同任务在 30 分钟内已推送过，插件可能仍在下载中，无需重复推送",
+                                }
+                        except Exception:
+                            pass
 
             task_id = uuid.uuid4().hex[:12]
             t = LocalTask(
@@ -203,4 +229,3 @@ async def get_xm_cookie(auth: dict = Depends(get_current_card)):
         if c:
             accounts.append({"id": aid, "cookie": c})
     return {"success": True, "accounts": accounts}
-
