@@ -7,7 +7,6 @@
 import base64
 import random
 import secrets
-import string
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,10 +32,12 @@ _state_lock = threading.Lock()
 
 
 def _client_ip(request: Request) -> str:
-    # 直连部署：不信 X-Forwarded-For——攻击者每请求换一个伪造 IP 即可让按 IP
+    # 直连部署默认不信 X-Forwarded-For——攻击者每请求换一个伪造 IP 即可让按 IP
     # 计数的失败锁定失效（与 app.py 的 admin_lan_only 中间件同一原则）。
-    # 若将来引入可信反向代理，需按白名单在此解析 XFF。
-    return request.client.host if request.client else "unknown"
+    # 管理端开启 trust_proxy_header（可信反代部署）后才解析 XFF/X-Real-IP，
+    # 统一走 core.device_binding.resolve_client_ip（IP 绑定/限流同一来源）。
+    from core.device_binding import resolve_client_ip
+    return resolve_client_ip(request) or "unknown"
 
 
 def _gen_captcha() -> tuple[str, str]:
@@ -97,9 +98,7 @@ class LoginRequest(BaseModel):
     code: str
     captchaId: str = ""
     captcha: str = ""
-    # ── 设备绑定（可选字段，向后兼容旧客户端；开关开启后必填 deviceId）──
-    deviceId: str = ""      # 客户端持久化的设备 ID（网页 localStorage / 插件 chrome.storage）
-    client: str = "web"     # 登录端类型：web=网页 | extension=插件（默认 web）
+    client: str = "web"     # 登录端类型：web=网页 | extension=插件（默认 web，信息字段）
 
 
 @router.get("/captcha")
@@ -173,33 +172,22 @@ async def login(req: LoginRequest, request: Request):
             if card.expiry_type == "days" and card.activated_at is None:
                 card.activated_at = datetime.now(timezone.utc)
 
-        # ── 设备绑定：席位维护 + 顶号自动换绑（开关关闭时完全跳过）──
+        # ── 网络绑定：同一出口 IP 不限设备，换公网 IP 登录才顶号（开关关闭时完全跳过）──
         from core import device_binding as dvb
-        client_ip = ip
+        client_type = dvb.normalize_client_type(req.client)   # 信息字段，非法值按 None 记录
+        net_key = None
         if dvb.device_binding_enabled():
-            client_type = dvb.normalize_client_type(req.client)
-            if not client_type:
-                raise HTTPException(status_code=400, detail="client 参数非法（仅支持 web / extension）")
-            device_id = (req.deviceId or "").strip()
-            if not device_id or len(device_id) > 64:
-                # 开关开启后必须携带设备 ID，否则删除该字段即可绕过绑定
-                raise HTTPException(
-                    status_code=403,
-                    detail="当前服务器已开启设备绑定，请更新网页（刷新页面）或插件到最新版本后重试",
-                )
-            dvb.bind_device_on_login(db, card, client_type, device_id, client_ip)
-        else:
-            # 开关关闭 = 完全恢复历史行为：不校验、也不落 device_id 到会话。
-            # 注意不能"顺手记录" device_id：若记录了但未建绑定，之后开启开关时
-            # 这批会话会因设备不在绑定表而被误判"已被顶下线"，破坏平滑过渡。
-            client_type = None
-            device_id = None
+            net_key = dvb.ip_scope_key(ip)
+            if net_key:
+                dvb.bind_network_on_login(db, card, client_type, net_key, ip)
+            # net_key 为 None（客户端 IP 无法解析）：不建绑定，会话按历史免绑定
+            # 会话处理（校验放行），fail-open 不阻断登录。
 
         # 生成新会话 token
         token = secrets.token_urlsafe(32)
         db.add(CardSession(token=token, card_id=card.id, is_active=True,
                            last_active_at=datetime.now(timezone.utc),
-                           client_type=client_type, device_id=device_id, ip=client_ip))
+                           client_type=client_type, device_id=net_key, ip=ip))
         card.last_login_at = datetime.now(timezone.utc)
         db.commit()
 

@@ -10,7 +10,6 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
 
 from db.session import SessionLocal
 from db.models import Session as CardSession
@@ -105,6 +104,14 @@ async def poll_scan_ws(websocket: WebSocket):
         if is_expired(sess.card):
             mark_expired(db, sess.card)
             await websocket.send_json({"success": False, "error": "卡密已过期"})
+            await websocket.close()
+            return
+        # 网络绑定校验：与 REST 鉴权（deps._auth_card）同标准，堵住 WS 侧旁路
+        # （starlette WebSocket 同样有 .client / .headers，resolve_client_ip 通用）
+        from core import device_binding as _dvb
+        ok, _bind_code, bind_msg = _dvb.check_session(db, sess, _dvb.resolve_client_ip(websocket))
+        if not ok:
+            await websocket.send_json({"success": False, "error": bind_msg})
             await websocket.close()
             return
         bound = card_bound_interfaces(sess.card)

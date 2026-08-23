@@ -226,14 +226,11 @@ async function setQueue(q) {
 }
 
 // ── 旧 storage 工具（保留）──
-function cfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token', 'deviceId'], r)) }
-// 设备绑定：所有带鉴权的请求统一附加 X-Device-Id（服务端开关关闭时忽略）
+function cfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token'], r)) }
 async function authHeaders() {
-  const { token, deviceId } = await cfg()
+  const { token } = await cfg()
   if (!token) return null
-  const h = { Authorization: 'Bearer ' + token }
-  if (deviceId) h['X-Device-Id'] = deviceId
-  return h
+  return { Authorization: 'Bearer ' + token }
 }
 
 // 401 统一处理：清本地登录态 + 记录原因（popup 打开时展示）+ 桌面通知。
@@ -798,7 +795,7 @@ function resolveTerminal(downloadId) {
 }
 
 async function runTrack(taskId, trackId) {
-  const { serverUrl, token, deviceId } = await cfg()
+  const { serverUrl, token } = await cfg()
   let downloadId = null
   let lastErr = null
   const settings = await getSettings()
@@ -850,7 +847,7 @@ async function runTrack(taskId, trackId) {
       })
       if (shouldSkip) return
 
-      const url = await resolveForTrack(task, tr, { serverUrl, token, deviceId })
+      const url = await resolveForTrack(task, tr, { serverUrl, token })
       if (!url) throw new Error('解析结果为空')
       const fname = buildFilename(task, tr, settings.downloadPrefix)
       console.log('[plugin] start download', trackId, fname)
@@ -895,7 +892,7 @@ async function resolveForTrack(task, tr, ctx) {
   }
   const resolver = globalThis.RESOLVERS[task.source]
   if (!resolver) throw new Error(`未实现解析器: ${task.source}（本地下载要求 extension/sources/ 下有同名脚本注册该音源。若后端新增了脚本接口，需在 sources/ 放对应 JS 脚本、并在 sources.config.js 的 PLUGIN_SOURCES 登记；否则请改用网页端「服务器端下载」）`)
-  const res = await resolver(tr, { serverUrl: ctx.serverUrl, token: ctx.token, deviceId: ctx.deviceId, quality: task.quality, fmt: task.fmt, albumId: task.album_id })
+  const res = await resolver(tr, { serverUrl: ctx.serverUrl, token: ctx.token, quality: task.quality, fmt: task.fmt, albumId: task.album_id })
   return typeof res === 'string' ? res : (res.url || '')
 }
 
@@ -1278,7 +1275,6 @@ async function markAccountCooldown(accountId, ctx) {
   if (!ctx || !ctx.serverUrl || !ctx.token || !accountId) return
   try {
     const cdHeaders = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + ctx.token }
-    if (ctx.deviceId) cdHeaders['X-Device-Id'] = ctx.deviceId
     await fetch(`${ctx.serverUrl}/api/extension/xm-cookie/cooldown`, {
       method: 'POST',
       headers: cdHeaders,

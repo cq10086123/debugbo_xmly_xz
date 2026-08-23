@@ -26,7 +26,7 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy.orm import relationship, mapped_column
 
 from db.session import Base
 
@@ -52,7 +52,7 @@ class Card(Base):
     # 下载模式权限：server=仅服务器下载 | local=仅本地下载 | both=都允许（默认）
     # NULL 与 'both' 等价，保证历史卡与未设置卡向后兼容（两种都可用）
     download_mode = mapped_column(String(16), default="both", nullable=True)
-    # 设备绑定：每席位（web/extension）允许绑定的设备数（默认 1）
+    # 网络绑定：允许同时绑定的网络（出口 IP）数（默认 1，同一网络下不限设备）
     # NULL → 按 1 处理；由 core/device_binding.py 统一读取，业务代码不直接判空
     max_devices = mapped_column(Integer, nullable=True)
     created_at = mapped_column(DateTime, default=_utcnow, nullable=False)
@@ -74,19 +74,20 @@ class Session(Base):
     created_at = mapped_column(DateTime, default=_utcnow, nullable=False)
     last_active_at = mapped_column(DateTime, default=_utcnow, nullable=False)
     is_active = mapped_column(Boolean, default=True, nullable=False)
-    # ── 设备绑定（core/device_binding.py 维护，全部可空以保证存量数据兼容）──
-    client_type = mapped_column(String(8), nullable=True)   # web | extension；NULL=历史会话
-    device_id = mapped_column(String(64), nullable=True, index=True)  # 客户端设备 ID；NULL=历史会话
+    # ── 网络绑定（core/device_binding.py 维护，全部可空以保证存量数据兼容）──
+    client_type = mapped_column(String(8), nullable=True)   # web | extension（信息字段）；NULL=历史会话
+    device_id = mapped_column(String(64), nullable=True, index=True)  # 出口网络键（如 1.2.3.0/24 / lan）；NULL=免绑定会话
     ip = mapped_column(String(64), nullable=True)           # 登录时出口 IP（风控用）
 
     card = relationship("Card", back_populates="sessions")
 
 
 class DeviceBinding(Base):
-    """设备绑定表 — 卡密席位与设备的当前绑定关系（core/device_binding.py 独占维护）
+    """网络绑定表 — 卡密与出口网络的当前绑定关系（core/device_binding.py 独占维护）
 
-    席位模型：每张卡密有 web / extension 两类席位，各允许 max_devices 台设备。
-    新设备登录且席位已满 → 淘汰 bound_at 最早的绑定（顶号换绑）并失效其会话。
+    device_id 存网络键（IPv4 /24、IPv6 /48 或 "lan"；列名沿用旧版，无需迁移）。
+    每张卡允许 max_devices 个网络；新网络登录且名额已满 → 淘汰 bound_at
+    最早的绑定（顶号换绑）并失效其会话。client_type 仅记录最先绑定的端。
     """
 
     __tablename__ = "device_bindings"

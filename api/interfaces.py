@@ -26,7 +26,7 @@ import re
 import time
 import uuid
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel

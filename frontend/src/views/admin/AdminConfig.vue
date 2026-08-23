@@ -19,10 +19,10 @@ const fields = [
   { key: 'auto_retry_max_rounds', label: '最大重试轮数', type: 'number' },
   { key: 'admin_path', label: '后台管理地址', type: 'text' },
   { key: 'admin_lan_only', label: '局域网访问限制', type: 'bool' },
-  { key: 'device_binding_enabled', label: '设备绑定（一卡一机）', type: 'bool' },
+  { key: 'device_binding_enabled', label: '网络绑定（一卡一IP）', type: 'bool' },
   { key: 'session_idle_days', label: '会话空闲过期(天)', type: 'number' },
+  { key: 'trust_proxy_header', label: '信任反代IP头(XFF)', type: 'bool' },
   { key: 'token_multi_ip_kick', label: '同token多IP强制下线', type: 'bool' },
-  { key: 'device_seat_ip_mismatch', label: '席位IP不一致处置', type: 'text' },
 ]
 
 const cfg = reactive({})
@@ -109,10 +109,12 @@ onMounted(load)
         小写字母开头，仅含小写字母/数字/-/_，修改后<b>需重启服务</b>才生效。
         管理后台 API 与文档页受「局域网访问限制」开关控制：开启时仅允许局域网 IP 访问，关闭后公网也可访问（请确保已修改强密码，并尽量走 HTTPS）。
         <br />
-        「设备绑定」开启后：卡密按席位绑定设备（网页席/插件席各限若干台，默认 1 台，卡密管理中可按卡调整），新设备登录自动顶掉旧设备；
+        「网络绑定」开启后按<b>出口 IP</b>限制登录环境：同一公网 IP（同一家庭宽带，IPv4 按 /24、IPv6 按 /48 归一，局域网视为同一网络）下<b>不限设备与浏览器数量</b>；
+        只有换到另一个公网 IP 登录才触发顶号换绑（淘汰同族最早绑定的网络并踢其会话）。网络数按 IPv4/IPv6 分别计算（双栈家庭 v4、v6 各占各的名额，互不误踢），默认每族 1 个，卡密管理中可按卡调整（设 2 可同时容纳家里+公司）。
         存量已登录用户不受影响，下次登录起绑定。关闭 = 完全恢复历史行为（一键回退）。
-        「同token多IP强制下线」：同一登录凭证在 10 分钟内来自多个公网 IP 时判定共享并强制下线。
-        「席位IP不一致处置」：alert=仅记录告警日志；enforce 可扩展为强制踢出（当前版本同 alert）。
+        <br />
+        「信任反代IP头」：服务部署在 nginx 等<b>可信反向代理</b>之后时开启，从 X-Forwarded-For / X-Real-IP 取真实客户端 IP（网络绑定、登录限流依赖真实 IP）；<b>直连部署务必保持关闭</b>，否则该头可被伪造。
+        「同token多IP强制下线」：同一登录凭证 10 分钟内来自多个公网网段时判定共享并强制下线（网络绑定关闭时的兜底防线）。
       </p>
       <button class="success" :disabled="saving" @click="save">{{ saving ? '保存中…' : '💾 保存配置' }}</button>
     </div>
