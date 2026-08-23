@@ -76,10 +76,20 @@ def test_is_ip_scope_key():
     assert not dvb.is_ip_scope_key(None)
 
 
+def test_key_family():
+    """协议族判定：名额/淘汰按族隔离的基础。"""
+    assert dvb.key_family("1.2.3.0/24") == "v4"
+    assert dvb.key_family("2606:4700:aaaa::/48") == "v6"
+    assert dvb.key_family("lan") == "lan"
+    assert dvb.key_family("browser-uuid") is None      # 旧版遗留
+    assert dvb.key_family(None) is None
+
+
 def test_check_session_pure():
-    """会话网络校验：同网络不限设备，换网络才拒。"""
+    """会话网络校验：来自任一已绑定网络即放行（双栈友好），未绑定网络才拒。"""
     now = datetime.now(timezone.utc)
     net = "1.2.3.0/24"
+    net_v6 = "2606:4700:aaaa::/48"
 
     # 历史/免绑定会话 → 放行
     ok, code, _ = dvb.check_session_pure(None, now, net, set(), 7, now)
@@ -97,11 +107,18 @@ def test_check_session_pure():
     ok, code, _ = dvb.check_session_pure(net, now, None, {net}, 7, now)
     assert ok and not code
 
-    # 换到另一个公网网段 → network_changed（重新登录即换绑）
+    # 双栈：v4 会话 + 请求走 v6，v6 已绑定 → 放行（Happy Eyeballs 不误踢）
+    ok, code, _ = dvb.check_session_pure(net, now, net_v6, {net, net_v6}, 7, now)
+    assert ok and not code
+
+    # 请求来自未绑定的网络 → network_changed（token 外带 / 换了家庭）
     ok, code, _ = dvb.check_session_pure(net, now, "5.6.7.0/24", {net}, 7, now)
     assert not ok and code == "network_changed"
+    # 双栈会话请求走 v6 但 v6 尚未绑定 → 同样要求重新登录（登录即补绑 v6）
+    ok, code, _ = dvb.check_session_pure(net, now, net_v6, {net}, 7, now)
+    assert not ok and code == "network_changed"
 
-    # 绑定已被新网络顶掉 → kicked
+    # 会话所属网络的绑定已被顶掉 → kicked（优先于网络比对）
     ok, code, msg = dvb.check_session_pure(net, now, net, {"5.6.7.0/24"}, 7, now)
     assert not ok and code == "kicked" and "其他网络" in msg
 
@@ -195,6 +212,67 @@ def test_bind_and_evict_integration():
         db.commit()
         assert r5["evicted"] == [n1]                         # bound_at 最早的被淘汰
         assert dvb.bound_network_keys(db, card2.id) == {n2, n3}
+    finally:
+        db.close()
+
+
+def test_dual_stack_families():
+    """双栈家庭：v4 与 v6 名额按族隔离，互不淘汰；同族才互顶。"""
+    SessionLocal = _setup_db()
+    db = SessionLocal()
+    try:
+        card = _mk_card(db, "XM-TEST-0006", max_devices=1)
+        v4_home = dvb.ip_scope_key("36.5.6.10")
+        v6_home = dvb.ip_scope_key("240e:aaaa:bbbb:cccc::1")
+        v4_other = dvb.ip_scope_key("98.7.6.5")
+        v6_other = dvb.ip_scope_key("2606:4700:9999::1")
+
+        # v4 登录后 v6 登录（同一家庭双栈）→ 并存，不互踢
+        dvb.bind_network_on_login(db, card, "web", v4_home)
+        r = dvb.bind_network_on_login(db, card, "web", v6_home)
+        db.commit()
+        assert r["evicted"] == []
+        assert dvb.bound_network_keys(db, card.id) == {v4_home, v6_home}
+
+        # 双栈稳态下会话校验：v4 会话从 v6 出口来（浏览器切换协议）→ 放行
+        bound = dvb.bound_network_keys(db, card.id)
+        ok, code, _ = dvb.check_session_pure(v4_home, datetime.now(timezone.utc), v6_home, bound, 7)
+        assert ok and not code
+
+        # 别人家的 v4 登录 → 只顶掉 v4 名额，v6 不受牵连
+        _mk_session(db, card, v4_home, "web", token="tok-v4-home")
+        r2 = dvb.bind_network_on_login(db, card, "web", v4_other)
+        db.commit()
+        assert r2["evicted"] == [v4_home] and r2["kicked_sessions"] == 1
+        assert dvb.bound_network_keys(db, card.id) == {v6_home, v4_other}
+
+        # 别人家的 v6 登录 → 只顶掉 v6 名额
+        r3 = dvb.bind_network_on_login(db, card, "web", v6_other)
+        db.commit()
+        assert r3["evicted"] == [v6_home]
+        assert dvb.bound_network_keys(db, card.id) == {v4_other, v6_other}
+    finally:
+        db.close()
+
+
+def test_legacy_binding_evicted_on_login():
+    """旧版遗留的浏览器设备 ID 绑定：任何网络登录时一律先淘汰（尽快换轨）。"""
+    SessionLocal = _setup_db()
+    db = SessionLocal()
+    try:
+        from db.models import DeviceBinding
+        card = _mk_card(db, "XM-TEST-0007", max_devices=1)
+        # 模拟升级前残留的设备 ID 绑定
+        db.add(DeviceBinding(card_id=card.id, client_type="web", device_id="old-browser-uuid",
+                             bound_at=datetime.now(timezone.utc),
+                             last_active_at=datetime.now(timezone.utc)))
+        db.commit()
+
+        net = dvb.ip_scope_key("77.8.9.10")
+        r = dvb.bind_network_on_login(db, card, "web", net)
+        db.commit()
+        assert "old-browser-uuid" in r["evicted"]
+        assert dvb.bound_network_keys(db, card.id) == {net}
     finally:
         db.close()
 
@@ -333,14 +411,20 @@ def test_risk_ip_network_key():
 
 
 def test_risk_record_token_ip():
-    """多网段判定：同 /24 不踢，跨公网网段才判定共享。"""
+    """多网段判定：同 /24 不踢、双栈 v4+v6 并存不踢，同族跨网段才判定共享。"""
     from api import risk_control as rc
     rc.forget_token("tok-risk")
     assert rc.record_token_ip("tok-risk", "192.168.1.10") is False        # 私网不计
     assert rc.record_token_ip("tok-risk", "1.2.3.4") is False             # 首个公网网段
     assert rc.record_token_ip("tok-risk", "1.2.3.200") is False           # 同 /24 → 正常
-    assert rc.record_token_ip("tok-risk", "5.6.7.8") is True              # 跨网段 → 共享
+    assert rc.record_token_ip("tok-risk", "2606:4700:aaaa::1") is False   # 双栈 v6 并存 → 正常
+    assert rc.record_token_ip("tok-risk", "5.6.7.8") is True              # 同族(v4)跨网段 → 共享
     rc.forget_token("tok-risk")
+
+    rc.forget_token("tok-risk6")
+    assert rc.record_token_ip("tok-risk6", "2606:4700:aaaa::1") is False
+    assert rc.record_token_ip("tok-risk6", "2606:4700:bbbb::1") is True   # 同族(v6)跨 /48 → 共享
+    rc.forget_token("tok-risk6")
 
 
 if __name__ == "__main__":
@@ -348,8 +432,11 @@ if __name__ == "__main__":
     test_get_max_devices()
     test_ip_scope_key()
     test_is_ip_scope_key()
+    test_key_family()
     test_check_session_pure()
     test_bind_and_evict_integration()
+    test_dual_stack_families()
+    test_legacy_binding_evicted_on_login()
     test_unbind_and_kick_integration()
     test_trim_bindings_to_limit()
     test_resolve_client_ip()

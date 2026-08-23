@@ -177,6 +177,20 @@ def is_ip_scope_key(v: str | None) -> bool:
     return v == LAN_SCOPE_KEY or "/" in v
 
 
+def key_family(net_key: str | None) -> str | None:
+    """网络键的协议族：v4 / v6 / lan（非网络键 → None）。
+
+    家庭宽带普遍 IPv4+IPv6 双栈，同一户会同时出现两个网络键（如
+    "1.2.3.0/24" 与 "240e:xxxx::/48"）。名额与淘汰按族隔离，
+    避免同一家庭的 v4/v6 互相顶号。
+    """
+    if not is_ip_scope_key(net_key):
+        return None
+    if net_key == LAN_SCOPE_KEY:
+        return "lan"
+    return "v6" if ":" in net_key else "v4"
+
+
 # ════════════════════════════════════════
 #  纯函数（可单测，不碰数据库）
 # ════════════════════════════════════════
@@ -215,25 +229,28 @@ def check_session_pure(
     """会话网络校验（纯函数）。返回 (ok, code, message)：
 
     - ok=True                放行（同网络下不限设备/浏览器数量）
-    - code=network_changed   出口网络与登录时不同（换了家庭/网络）→ 重新登录即换绑
-    - code=kicked            所属网络的绑定已被顶号换绑 / 解绑
+    - code=kicked            会话所属网络的绑定已被顶号换绑 / 解绑
+    - code=network_changed   请求来自该卡未绑定的网络（换了家庭/网络或 token 外带）
     - code=session_expired   会话空闲超时
     宽松原则：
     - sess_net_key 为空（历史/免绑定会话）或不是网络键（旧版遗留）→ 放行
     - request_net_key 为空（拿不到客户端 IP）→ 不作为踢出证据，放行
+    - 请求来自该卡**任一**已绑定网络即放行：双栈家庭 v4/v6 两个键都绑定后，
+      浏览器在两族间切换（Happy Eyeballs）不会被误踢。
     """
     if not sess_net_key or not is_ip_scope_key(sess_net_key):
         return True, "", ""
 
     now = now or datetime.now(timezone.utc)
 
-    # 1) 出口网络必须与登录时一致（换 IP = 换设备语义；不顶号，回原网络恢复）
-    if request_net_key is not None and request_net_key != sess_net_key:
-        return False, "network_changed", "网络环境已变更，请重新登录"
-
-    # 2) 会话所属网络必须仍在绑定名额内（防已被顶号/解绑的旧网络继续用）
+    # 1) 会话所属网络必须仍在绑定名额内（防已被顶号/解绑的旧网络继续用）
     if sess_net_key not in bound_net_keys:
         return False, "kicked", "账号已在其他网络登录，本设备已下线"
+
+    # 2) 请求必须来自该卡已绑定的某个网络（换 IP = 换设备语义；
+    #    不顶号，回已绑定网络自动恢复；在新网络重新登录即换绑）
+    if request_net_key is not None and request_net_key not in bound_net_keys:
+        return False, "network_changed", "网络环境已变更，请重新登录"
 
     # 3) 空闲过期
     last = _aware(sess_last_active)
@@ -278,11 +295,15 @@ def deactivate_network_sessions(db, card_id: int, net_key: str) -> int:
 def bind_network_on_login(db, card, client_type: str | None, net_key: str, ip: str | None = None) -> dict:
     """登录时维护网络绑定（名额已满 → 顶号自动换绑，淘汰最早绑定的网络）。
 
+    名额按协议族（v4 / v6 / lan）隔离：每族允许 max_devices 个网络。
+    双栈家庭的 v4 与 v6 各占各的名额、互不淘汰；旧版遗留的浏览器设备 ID
+    绑定（family=None）在任何族登录时都优先淘汰（尽快换轨）。
     返回 {binding, evicted: [被踢网络键], kicked_sessions: n}。调用方负责 commit。
     """
     with _BIND_LOCK:
         max_devices = get_max_devices(card)
-        existing = (
+        family = key_family(net_key)
+        rows = (
             db.query(DeviceBinding)
             .filter_by(card_id=card.id)
             .order_by(DeviceBinding.bound_at.asc())
@@ -290,17 +311,26 @@ def bind_network_on_login(db, card, client_type: str | None, net_key: str, ip: s
         )
 
         # 同网络已绑定：续活并更新 IP，无需换绑
-        for row in existing:
+        for row in rows:
             if row.device_id == net_key:
                 row.last_active_at = datetime.now(timezone.utc)
                 row.last_ip = ip or row.last_ip
                 return {"binding": row, "evicted": [], "kicked_sessions": 0}
 
-        # 名额已满：淘汰最早的绑定（顶号换绑）
+        # 淘汰候选：旧版遗留绑定（非网络键）+ 同族绑定；异族绑定不动
+        legacy = [r for r in rows if key_family(r.device_id) is None]
+        same_family = [r for r in rows if key_family(r.device_id) == family]
+
         evicted: list[str] = []
         kicked_sessions = 0
-        while len(existing) >= max_devices:
-            oldest = existing.pop(0)
+        # 旧版遗留绑定一律先淘汰（不占新机制名额，尽快清理换轨）
+        for old in legacy:
+            evicted.append(old.device_id)
+            kicked_sessions += deactivate_network_sessions(db, card.id, old.device_id)
+            db.delete(old)
+        # 同族名额已满：淘汰最早绑定的同族网络（顶号换绑）
+        while len(same_family) >= max_devices:
+            oldest = same_family.pop(0)
             evicted.append(oldest.device_id)
             kicked_sessions += deactivate_network_sessions(db, card.id, oldest.device_id)
             db.delete(oldest)
@@ -345,9 +375,10 @@ def touch_binding(db, card_id: int, net_key: str | None, ip: str | None = None) 
 
 
 def trim_bindings_to_limit(db, card) -> int:
-    """把绑定数裁剪回 max_devices（淘汰 bound_at 最早的），并失效被裁网络的会话。
+    """把各协议族绑定数裁剪回 max_devices（淘汰 bound_at 最早的），并失效被裁网络的会话。
 
     用于管理员下调 max_devices 后即时收敛存量绑定。返回被裁掉的绑定数。
+    旧版遗留绑定（非网络键）不主动裁剪，等登录时自然清理。
     """
     with _BIND_LOCK:
         max_devices = get_max_devices(card)
@@ -357,16 +388,24 @@ def trim_bindings_to_limit(db, card) -> int:
             .order_by(DeviceBinding.bound_at.asc())
             .all()
         )
-        excess = rows[: max(0, len(rows) - max_devices)]
-        for row in excess:
-            deactivate_network_sessions(db, card.id, row.device_id)
-            db.delete(row)
-        if excess:
+        by_family: dict[str, list] = {}
+        for r in rows:
+            fam = key_family(r.device_id)
+            if fam is not None:
+                by_family.setdefault(fam, []).append(r)
+        trimmed = 0
+        for fam_rows in by_family.values():
+            excess = fam_rows[: max(0, len(fam_rows) - max_devices)]
+            for row in excess:
+                deactivate_network_sessions(db, card.id, row.device_id)
+                db.delete(row)
+                trimmed += 1
+        if trimmed:
             log_card_event(
                 "device_unbind", card.id,
-                f"卡密 {card.code} 网络数上限下调为 {max_devices}，裁剪超额绑定 {len(excess)} 个（即时失效）"
+                f"卡密 {card.code} 网络数上限下调为 {max_devices}，裁剪超额绑定 {trimmed} 个（即时失效）"
             )
-        return len(excess)
+        return trimmed
 
 
 def unbind_device(db, card, net_key: str) -> int:

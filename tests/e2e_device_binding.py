@@ -147,6 +147,16 @@ def main():
             msg = ws.receive_json()   # 缺 qr_id 的业务报错 = 已通过鉴权与网络校验
             assert "qr_id" in msg.get("error", ""), msg
 
+        # 8) 双栈家庭：v6 登录与 v4 并存不互踢；会话跨协议族访问也放行
+        v6home = {"X-Forwarded-For": "240e:aaaa:bbbb:cccc::9"}
+        sv, jv = do_login(client, card_code, "web", headers=v6home)
+        assert sv == 200 and jv["success"], (sv, jv)
+        assert me(client, ji["token"], home)[0] == 200        # v4 会话未被顶
+        assert me(client, jv["token"], v6home)[0] == 200      # v6 会话正常
+        # v4 会话从 v6 出口访问（Happy Eyeballs 切换）→ 放行，且不触发多网段风控误杀
+        assert me(client, ji["token"], v6home)[0] == 200
+        assert me(client, ji["token"], home)[0] == 200
+
         print("E2E ALL PASS")
 
 

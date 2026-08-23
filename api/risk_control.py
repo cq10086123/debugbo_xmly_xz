@@ -59,9 +59,12 @@ def _ip_network_key(ip: str) -> str | None:
 
 
 def record_token_ip(token: str, ip: str | None) -> bool:
-    """记录 token 本次来源 IP（按网段归一）；窗口内出现 ≥2 个不同公网网段
-    时返回 True（判定共享拷贝）。
+    """记录 token 本次来源 IP（按网段归一）；窗口内**同一协议族**出现 ≥2 个
+    不同公网网段时返回 True（判定共享拷贝）。
 
+    v4 与 v6 分开计数：双栈用户的浏览器会在 IPv4/IPv6 间切换（Happy
+    Eyeballs），同一 token 短窗口内 v4+v6 并存是正常现象，不作共享证据；
+    同族两个不同网段（如两个 /24）才是真正的多地并用。
     fail-safe：任何异常返回 False（放行）。
     """
     if not token or not ip:
@@ -84,7 +87,8 @@ def record_token_ip(token: str, ip: str | None) -> bool:
                 oldest = sorted(_IP_MAP.items(), key=lambda kv: max(kv[1].values() or [0]))[: _IP_MAP_MAX // 2]
                 for t, _ in oldest:
                     del _IP_MAP[t]
-            return len(nets_map) >= 2
+            same_family = [k for k in nets_map if (":" in k) == (":" in net)]
+            return len(same_family) >= 2
     except Exception:
         return False
 
