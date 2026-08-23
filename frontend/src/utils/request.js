@@ -1,5 +1,4 @@
 import axios from 'axios'
-import { getDeviceId } from './deviceId'
 
 // 业务 token（卡密登录）
 const BIZ_KEY = 'auth_token'
@@ -52,14 +51,12 @@ export async function probeAdminPath(p) {
   }
 }
 
-function makeInstance(baseURL, tokenGetter, onUnauthorized, deviceHeader) {
+function makeInstance(baseURL, tokenGetter, onUnauthorized) {
   const inst = axios.create({ baseURL, timeout: 60000 })
   inst.interceptors.request.use((cfg) => {
     const t = tokenGetter()
     if (t) cfg.headers = cfg.headers || {}
     if (t) cfg.headers.Authorization = `Bearer ${t}`
-    // 设备绑定：业务接口统一携带 X-Device-Id（服务端开关关闭时忽略此头）
-    if (deviceHeader && t) cfg.headers['X-Device-Id'] = getDeviceId()
     return cfg
   })
   inst.interceptors.response.use(
@@ -75,7 +72,7 @@ function makeInstance(baseURL, tokenGetter, onUnauthorized, deviceHeader) {
   return inst
 }
 
-// 业务接口实例（带卡密 token + 设备 ID 头）—— baseURL /api
+// 业务接口实例（带卡密 token）—— baseURL /api
 export const bizApi = makeInstance(
   '/api',
   getBizToken,
@@ -95,8 +92,7 @@ export const bizApi = makeInstance(
     if (location.pathname !== '/login' && location.hash !== '#/login') {
       location.hash = '#/login'
     }
-  },
-  true
+  }
 )
 
 // 管理接口实例（带 admin token）—— baseURL 动态：/api/{admin_path}

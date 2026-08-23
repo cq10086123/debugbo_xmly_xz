@@ -478,24 +478,23 @@ async def delete_card(card_id: int, _: bool = Depends(get_current_admin)):
 
 
 # ════════════════════════════════════════
-#  设备绑定管理（卡密席位 × 设备）
+#  网络绑定管理（卡密 × 出口网络）
 # ════════════════════════════════════════
 
 
 class DeviceUnbindRequest(BaseModel):
-    device_id: str
-    client_type: str | None = None      # web/extension；空 = 两个席位都解绑
+    device_id: str      # 网络键（如 1.2.3.0/24 / lan；旧版遗留的设备 ID 同样可解绑）
 
 
 @router.get("/cards/{card_id}/devices")
 async def list_card_devices(card_id: int, _: bool = Depends(get_current_admin)):
-    """列出卡密的席位绑定详情（web/extension 各自的设备、活跃时间、IP）与在线会话数"""
+    """列出卡密的网络绑定详情（网络段、绑定时间、活跃时间、IP）与在线会话数"""
     db = SessionLocal()
     try:
         card = db.query(Card).filter_by(id=card_id).first()
         if not card:
             raise HTTPException(status_code=404, detail="卡密不存在")
-        devices = dvb.device_binding_status(card)
+        bindings = dvb.device_binding_status(card)
         active_sessions = (
             db.query(CardSession)
             .filter_by(card_id=card.id, is_active=True)
@@ -506,9 +505,8 @@ async def list_card_devices(card_id: int, _: bool = Depends(get_current_admin)):
             "card_id": card.id,
             "max_devices": dvb.get_max_devices(card),
             "binding_enabled": dvb.device_binding_enabled(),
-            "binding_scope": dvb.binding_scope(),
             "active_sessions": active_sessions,
-            "devices": devices,
+            "bindings": bindings,
         }
     finally:
         db.close()
@@ -516,30 +514,27 @@ async def list_card_devices(card_id: int, _: bool = Depends(get_current_admin)):
 
 @router.post("/cards/{card_id}/devices/unbind")
 async def unbind_card_device(card_id: int, req: DeviceUnbindRequest, _: bool = Depends(get_current_admin)):
-    """解绑单个设备：删除席位绑定并失效其全部会话（该设备需重新登录，不占换绑语义）"""
+    """解绑单个网络：删除绑定并失效其全部会话（该网络需重新登录，不占换绑名额）"""
     db = SessionLocal()
     try:
         card = db.query(Card).filter_by(id=card_id).first()
         if not card:
             raise HTTPException(status_code=404, detail="卡密不存在")
-        ct = dvb.normalize_client_type(req.client_type) if req.client_type else None
-        if req.client_type and not ct:
-            raise HTTPException(status_code=400, detail="client_type 非法（web / extension）")
-        device_id = req.device_id.strip()
-        if not device_id or len(device_id) > 64:
+        net_key = req.device_id.strip()
+        if not net_key or len(net_key) > 64:
             raise HTTPException(status_code=400, detail="device_id 非法（1~64 字符）")
-        n = dvb.unbind_device(db, card, device_id, ct)
+        n = dvb.unbind_device(db, card, net_key)
         if not n:
-            raise HTTPException(status_code=404, detail="该设备未绑定在此卡密")
+            raise HTTPException(status_code=404, detail="该网络未绑定在此卡密")
         db.commit()
-        return {"success": True, "message": "已解绑并下线该设备", "unbound": n}
+        return {"success": True, "message": "已解绑并下线该网络", "unbound": n}
     finally:
         db.close()
 
 
 @router.post("/cards/{card_id}/devices/unbind-all")
 async def unbind_all_card_devices(card_id: int, _: bool = Depends(get_current_admin)):
-    """解绑全部设备并踢下线全部会话（用户换机/售后专用）"""
+    """解绑全部网络并踢下线全部会话（用户换网/售后专用）"""
     db = SessionLocal()
     try:
         card = db.query(Card).filter_by(id=card_id).first()
@@ -547,7 +542,7 @@ async def unbind_all_card_devices(card_id: int, _: bool = Depends(get_current_ad
             raise HTTPException(status_code=404, detail="卡密不存在")
         n = dvb.unbind_all(db, card)
         db.commit()
-        return {"success": True, "message": f"已解绑 {n} 台设备并踢下线全部会话", "unbound": n}
+        return {"success": True, "message": f"已解绑 {n} 个网络并踢下线全部会话", "unbound": n}
     finally:
         db.close()
 

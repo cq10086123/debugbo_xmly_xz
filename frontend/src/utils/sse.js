@@ -1,5 +1,3 @@
-import { getDeviceId } from './deviceId'
-
 // 基于 fetch + ReadableStream 的 SSE 客户端。
 // 因为 EventSource 无法携带 Authorization 请求头，这里用 fetch 手动读取流。
 // 服务端 /api/.../batch/stream 返回 `data: {json}\n\n` 事件，心跳为 `: heartbeat`。
@@ -11,7 +9,7 @@ export function connectSSE(url, token, onMessage) {
   async function run() {
     try {
       const resp = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}`, 'X-Device-Id': getDeviceId() },
+        headers: { Authorization: `Bearer ${token}` },
         signal: ctrl.signal,
       })
       if (resp.status === 401) {

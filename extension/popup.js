@@ -10,26 +10,9 @@ function setMsg(text, cls) {
   el.textContent = text || ''
   el.className = 'status ' + (cls || '')
 }
-function getCfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token', 'card', 'deviceId', 'auth_error'], r)) }
+function getCfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token', 'card', 'auth_error'], r)) }
 function setCfg(obj) { return new Promise(r => chrome.storage.local.set(obj, r)) }
 
-// ── 设备 ID（设备绑定用）：首次生成后持久化，退出登录不清除 ──
-function genUuid() {
-  if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
-  const b = new Uint8Array(16)
-  crypto.getRandomValues(b)
-  b[6] = (b[6] & 0x0f) | 0x40
-  b[8] = (b[8] & 0x3f) | 0x80
-  const hex = Array.from(b, x => x.toString(16).padStart(2, '0')).join('')
-  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`
-}
-async function ensureDeviceId() {
-  const { deviceId } = await getCfg()
-  if (deviceId) return deviceId
-  const id = genUuid()
-  await setCfg({ deviceId: id })
-  return id
-}
 
 let curCaptchaId = ''
 async function loadCaptcha(serverUrl) {
@@ -139,7 +122,6 @@ $('loginBtn').onclick = async () => {
   const code = $('code').value.trim()
   if (!serverUrl || !code) { setMsg(BUILTIN_SERVER ? '请填写卡密' : '请填写服务器地址和卡密', 'err'); return }
   setMsg('登录中…')
-  const deviceId = await ensureDeviceId()
   try {
     const r = await fetch(`${serverUrl}/api/auth/login`, {
       method: 'POST',
@@ -148,7 +130,6 @@ $('loginBtn').onclick = async () => {
         code,
         captchaId: curCaptchaId,
         captcha: $('captcha').value.trim(),
-        deviceId,          // 设备绑定：本插件的设备 ID
         client: 'extension',
       }),
     })
