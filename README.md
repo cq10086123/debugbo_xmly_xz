@@ -242,7 +242,7 @@ registerSource({ name: 'A', displayName: '免密A' }, async (chapter, ctx) => {
 | 配置键 | 说明 | 默认 |
 |--------|------|------|
 | `device_binding_enabled` | 网络绑定总开关；关闭 = 完全恢复历史行为（一键回退） | 关 |
-| `trust_proxy_header` | 信任反向代理传递的 `X-Forwarded-For` / `X-Real-IP`（**部署在 nginx 等可信反代后必须开启**，否则所有用户 IP 都是代理 IP，网络绑定会失效；直连部署务必保持关闭防伪造） | 关 |
+| `trust_proxy_header` | 信任反向代理传递的 `X-Forwarded-For` / `X-Real-IP`（**部署在 nginx 等可信反代后必须开启**，否则所有用户 IP 都是代理 IP，网络绑定会失效；直连部署务必保持关闭防伪造）。解析取 XFF **最右侧**合法 IP（可信代理追加的真实来源，防止客户端自带伪造头），适用于单层可信代理 | 关 |
 | `session_idle_days` | 会话空闲过期天数 | 7 |
 | `token_multi_ip_kick` | 同 token 10 分钟内多公网网段并用 → 强制下线（绑定关闭时的兜底防线） | 开 |
 

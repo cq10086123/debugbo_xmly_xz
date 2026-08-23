@@ -274,7 +274,8 @@ def test_resolve_client_ip():
     # 默认（不信任代理头）→ 直连 IP
     assert dvb.resolve_client_ip(_Req()) == "9.9.9.9"
 
-    # 开启 trust_proxy_header → 取 XFF 首个合法 IP
+    # 开启 trust_proxy_header → 取 XFF 最右侧合法 IP（可信代理追加的真实来源；
+    # 最左侧可被客户端伪造，nginx 追加模式下不可信）
     from db.models import ApiConfig
     SessionLocal = _setup_db()
     db = SessionLocal()
@@ -282,7 +283,15 @@ def test_resolve_client_ip():
         db.add(ApiConfig(cfg_key="trust_proxy_header", cfg_value="1", category="settings"))
         db.commit()
         dvb.invalidate_cfg_cache()
-        assert dvb.resolve_client_ip(_Req()) == "1.2.3.4"
+        # 伪造场景：客户端自带 "1.2.3.4"，代理追加真实 IP "8.8.4.4" → 取 8.8.4.4
+        class _ReqSpoof(_Req):
+            headers = {"x-forwarded-for": "1.2.3.4, 8.8.4.4"}
+        assert dvb.resolve_client_ip(_ReqSpoof()) == "8.8.4.4"
+
+        # 单值 XFF（nginx 覆盖模式 $remote_addr）→ 直接取
+        class _ReqSingle(_Req):
+            headers = {"x-forwarded-for": "1.2.3.4"}
+        assert dvb.resolve_client_ip(_ReqSingle()) == "1.2.3.4"
 
         # XFF 全非法 → 回退 X-Real-IP
         class _Req2(_Req):

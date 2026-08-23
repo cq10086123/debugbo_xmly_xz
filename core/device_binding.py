@@ -119,16 +119,17 @@ def resolve_client_ip(request) -> str | None:
     if request is None or not trust_proxy_header():
         return direct
     try:
+        # XFF 从右往左取第一个合法 IP：最右侧是可信代理亲手追加的真实来源；
+        # 左侧字段可被客户端伪造（nginx $proxy_add_x_forwarded_for 为追加模式，
+        # 若取最左侧，攻击者自带伪造 XFF 即可冒充任意 IP/局域网）。
         xff = request.headers.get("x-forwarded-for") or ""
-        for part in xff.split(","):
-            p = part.strip()
-            if not p:
-                continue
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        for p in reversed(parts):
             try:
                 ipaddress.ip_address(p)
                 return p
             except ValueError:
-                continue   # 非法段跳过，继续找下一个/回退 X-Real-IP
+                continue   # 非法段跳过，继续向左找/回退 X-Real-IP
         xri = (request.headers.get("x-real-ip") or "").strip()
         if xri:
             try:

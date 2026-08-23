@@ -63,7 +63,7 @@ function makeInstance(baseURL, tokenGetter, onUnauthorized) {
     (resp) => resp,
     (err) => {
       if (err.response && err.response.status === 401) {
-        // 把服务端语义（已在其他设备登录/登录过期等）交给回调提示
+        // 把服务端语义（已在其他网络登录/登录过期等）交给回调提示
         onUnauthorized(err.response.data && err.response.data.detail)
       }
       return Promise.reject(err)

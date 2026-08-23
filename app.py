@@ -133,7 +133,11 @@ async def admin_lan_only(request: Request, call_next):
         if not get_admin_lan_only():
             # 开关关闭：允许公网访问管理后台与文档页（即时生效，无需重启）
             return await call_next(request)
-        client_ip = request.client.host if request.client else ""
+        # 经 resolve_client_ip 取真实来源：trust_proxy_header 开启（可信反代部署）时
+        # 解析 XFF/X-Real-IP —— 否则反代场景下所有请求的直连 IP 都是代理 IP（内网），
+        # 「仅局域网」限制会对公网访客形同虚设；开关关闭时行为与直连语义完全一致。
+        from core.device_binding import resolve_client_ip
+        client_ip = resolve_client_ip(request) or ""
         if not _is_lan_ip(client_ip):
             logger.warning(f"拒绝公网访问管理后台: {client_ip} -> {path}")
             return JSONResponse({"detail": "管理后台仅允许局域网访问"}, status_code=403)

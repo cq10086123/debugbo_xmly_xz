@@ -6,7 +6,7 @@ import { useAuthStore } from '../stores/auth'
 const auth = useAuthStore()
 const router = useRouter()
 
-// 登录态心跳（60s）：服务端开启设备绑定后，本机被顶号/踢下线时
+// 登录态心跳（60s）：服务端开启网络绑定后，本机被顶号/踢下线时
 // 经 /auth/me 的 401 → 拦截器清 token + 提示 + 跳登录，实现分钟级感知。
 let heartbeatTimer = null
 

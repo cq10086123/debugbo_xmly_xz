@@ -138,6 +138,15 @@ def main():
         assert si == 200 and ji["success"], (si, ji)
         assert me(client, ji["token"], home)[0] == 200
 
+        # 7) WebSocket 旁路（扫码轮询 /ws/poll）同样受网络校验约束
+        with client.websocket_connect(f"/api/accounts/ws/poll?token={ji['token']}", headers=other) as ws:
+            msg = ws.receive_json()
+            assert msg.get("success") is False and "网络环境已变更" in msg.get("error", ""), msg
+        with client.websocket_connect(f"/api/accounts/ws/poll?token={ji['token']}", headers=home) as ws:
+            ws.send_json({"qr_id": ""})
+            msg = ws.receive_json()   # 缺 qr_id 的业务报错 = 已通过鉴权与网络校验
+            assert "qr_id" in msg.get("error", ""), msg
+
         print("E2E ALL PASS")
 
 
