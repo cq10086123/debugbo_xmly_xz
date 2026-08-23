@@ -131,6 +131,25 @@ def main():
         code_g, _ = me(client, jg["token"])                    # 不带设备头也能用
         assert code_g == 200
 
+        # ── 平滑过渡回归：关闭期登录（即使客户端带了 deviceId）→ 重新开启 → 会话不受影响 ──
+        # 回归背景：曾把关闭期登录的 device_id 落库但未建绑定，开启开关后这批会话
+        # 会被误判"已在其他设备登录"。修复后关闭期完全不落 device_id。
+        r = client.put("/api/admin/config", headers=admin_token, json={"config": {"device_binding_enabled": "0"}})
+        assert r.json().get("success")
+        sh, jh = do_login(client, card_code, "dev-LEGACY", "web")   # 带了 deviceId 也登录成功
+        assert sh == 200 and jh["success"], (sh, jh)
+        r = client.put("/api/admin/config", headers=admin_token, json={"config": {"device_binding_enabled": "1"}})
+        assert r.json().get("success")
+        code_h, _ = me(client, jh["token"], "dev-LEGACY")           # 开启后旧会话仍可用
+        assert code_h == 200, (code_h, _)
+        # 新登录正常走绑定
+        si, ji = do_login(client, card_code, "dev-NEW2", "web")
+        assert si == 200 and ji["success"], (si, ji)
+        code_i, _ = me(client, jh["token"], "dev-LEGACY")           # 过渡会话无设备关系，不被顶号
+        assert code_i == 200                                          # 存量放行至自然重登录
+        code_n, _ = me(client, ji["token"], "dev-NEW2")               # 新设备正常
+        assert code_n == 200
+
         print("E2E ALL PASS")
 
 

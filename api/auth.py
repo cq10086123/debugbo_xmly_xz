@@ -173,7 +173,7 @@ async def login(req: LoginRequest, request: Request):
             if card.expiry_type == "days" and card.activated_at is None:
                 card.activated_at = datetime.now(timezone.utc)
 
-        # ── 设备绑定：席位维护 + 顶号自动换绑（开关关闭时仅记录不限制）──
+        # ── 设备绑定：席位维护 + 顶号自动换绑（开关关闭时完全跳过）──
         from core import device_binding as dvb
         client_ip = ip
         if dvb.device_binding_enabled():
@@ -189,9 +189,11 @@ async def login(req: LoginRequest, request: Request):
                 )
             dvb.bind_device_on_login(db, card, client_type, device_id, client_ip)
         else:
-            # 开关关闭：不限制，但客户端带了 deviceId 就顺手记录（便于开启后无缝过渡）
-            client_type = dvb.normalize_client_type(req.client) or None
-            device_id = (req.deviceId or "").strip() or None
+            # 开关关闭 = 完全恢复历史行为：不校验、也不落 device_id 到会话。
+            # 注意不能"顺手记录" device_id：若记录了但未建绑定，之后开启开关时
+            # 这批会话会因设备不在绑定表而被误判"已被顶下线"，破坏平滑过渡。
+            client_type = None
+            device_id = None
 
         # 生成新会话 token
         token = secrets.token_urlsafe(32)

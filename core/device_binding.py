@@ -170,6 +170,12 @@ def bound_device_ids(db, card_id: int, client_type: str) -> set[str]:
     return {r.device_id for r in rows}
 
 
+# 绑定维护互斥锁：登录的「查席位 → 淘汰 → 插入」是非原子序列，并发登录同一卡密
+# 会双写超额绑定（TOCTOU）。单进程自托管（uvicorn 单 worker，与 api/auth.py 的
+# 验证码限流状态同一前提）下，进程内锁即可保证串行。登录是低频操作，全局锁足够。
+_BIND_LOCK = threading.Lock()
+
+
 def deactivate_device_sessions(db, card_id: int, client_type: str | None, device_id: str) -> int:
     """失效指定设备的全部活跃会话（顶号/解绑/踢线共用）。返回失效条数。"""
     q = db.query(CardSession).filter_by(
@@ -189,6 +195,11 @@ def bind_device_on_login(db, card, client_type: str, device_id: str, ip: str | N
     返回 {binding, evicted: [被踢设备ID], kicked_sessions: n}
     调用方负责 commit。
     """
+    with _BIND_LOCK:
+        return _bind_device_on_login_locked(db, card, client_type, device_id, ip)
+
+
+def _bind_device_on_login_locked(db, card, client_type: str, device_id: str, ip: str | None = None) -> dict:
     max_devices = get_max_devices(card)
     existing = (
         db.query(DeviceBinding)
@@ -257,6 +268,34 @@ def touch_binding(db, card_id: int, client_type: str | None, device_id: str, ip:
                 row.last_ip = ip
     except Exception:
         pass
+
+
+def trim_bindings_to_limit(db, card) -> int:
+    """把各席位绑定数裁剪回 max_devices（淘汰 bound_at 最早的），并失效被裁设备的会话。
+
+    用于管理员下调 max_devices 后即时收敛存量绑定。返回被裁掉的绑定数。
+    """
+    with _BIND_LOCK:
+        max_devices = get_max_devices(card)
+        trimmed = 0
+        for ct in VALID_CLIENT_TYPES:
+            rows = (
+                db.query(DeviceBinding)
+                .filter_by(card_id=card.id, client_type=ct)
+                .order_by(DeviceBinding.bound_at.asc())
+                .all()
+            )
+            excess = rows[: max(0, len(rows) - max_devices)]
+            for row in excess:
+                deactivate_device_sessions(db, card.id, row.client_type, row.device_id)
+                db.delete(row)
+                trimmed += 1
+        if trimmed:
+            log_card_event(
+                "device_unbind", card.id,
+                f"卡密 {card.code} 设备数上限下调为 {max_devices}，裁剪超额绑定 {trimmed} 台（即时失效）"
+            )
+        return trimmed
 
 
 def unbind_device(db, card, device_id: str, client_type: str | None = None) -> int:

@@ -364,7 +364,11 @@ async def patch_card(card_id: int, req: CardPatchRequest, _: bool = Depends(get_
         if req.max_devices is not None:
             if req.max_devices < 1 or req.max_devices > 10:
                 raise HTTPException(status_code=400, detail="max_devices 需在 1~10 之间")
+            old_max = dvb.get_max_devices(card)
             card.max_devices = req.max_devices
+            if req.max_devices < old_max:
+                # 下调上限：即时裁剪超额绑定（最早绑定的被裁），不等下次登录
+                dvb.trim_bindings_to_limit(db, card)
 
         # 修改到期时间/有效天数后，若按新值实际未过期，复活 expired 状态
         # （is_expired 对 status==expired 恒真，必须绕开它按日期直接判断）
@@ -520,7 +524,10 @@ async def unbind_card_device(card_id: int, req: DeviceUnbindRequest, _: bool = D
         ct = dvb.normalize_client_type(req.client_type) if req.client_type else None
         if req.client_type and not ct:
             raise HTTPException(status_code=400, detail="client_type 非法（web / extension）")
-        n = dvb.unbind_device(db, card, req.device_id.strip(), ct)
+        device_id = req.device_id.strip()
+        if not device_id or len(device_id) > 64:
+            raise HTTPException(status_code=400, detail="device_id 非法（1~64 字符）")
+        n = dvb.unbind_device(db, card, device_id, ct)
         if not n:
             raise HTTPException(status_code=404, detail="该设备未绑定在此卡密")
         db.commit()

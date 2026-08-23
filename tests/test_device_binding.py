@@ -234,6 +234,57 @@ def test_check_session_integration():
         db.close()
 
 
+def test_trim_bindings_to_limit():
+    """管理员下调 max_devices：超额绑定即时裁剪（保留最新）。"""
+    SessionLocal = _setup_db()
+    db = SessionLocal()
+    try:
+        card = _mk_card(db, "XM-TEST-0005", max_devices=3)
+        for d in ("dev-T1", "dev-T2", "dev-T3"):
+            dvb.bind_device_on_login(db, card, "web", d)
+            _mk_session(db, card, d, "web")
+        db.commit()
+        assert len(dvb.bound_device_ids(db, card.id, "web")) == 3
+
+        card.max_devices = 1
+        trimmed = dvb.trim_bindings_to_limit(db, card)
+        db.commit()
+        assert trimmed == 2
+        # 保留 bound_at 最新的 dev-T3，裁掉 T1/T2，且其会话失效
+        assert dvb.bound_device_ids(db, card.id, "web") == {"dev-T3"}
+        assert _active_tokens(db, card) == {"dev-T3"}
+    finally:
+        db.close()
+
+
+def test_risk_ip_network_key():
+    """风控 IP 网段归一化：私网不计、v4 /24、v6 /48。"""
+    from api.risk_control import _ip_network_key
+    assert _ip_network_key("192.168.1.10") is None        # 私网不作证据
+    assert _ip_network_key("127.0.0.1") is None           # 回环
+    assert _ip_network_key("10.0.0.5") is None
+    assert _ip_network_key("not-an-ip") is None
+    assert _ip_network_key("1.2.3.4") == _ip_network_key("1.2.3.99")     # 同 /24
+    assert _ip_network_key("1.2.3.4") != _ip_network_key("1.2.4.4")      # 不同 /24
+    v6 = "2606:4700:aaaa:bbbb:cccc:dddd:eeee:1111"
+    v6_same48 = "2606:4700:aaaa:ffff:0000:0000:0000:2222"                  # 同 /48
+    v6_diff48 = "2606:4700:bbbb:aaaa:0000:0000:0000:2222"                  # 不同 /48
+    assert _ip_network_key(v6) == _ip_network_key(v6_same48)
+    assert _ip_network_key(v6) != _ip_network_key(v6_diff48)
+    assert _ip_network_key("2001:db8::1") is None                          # 文档段=非公网，不作证据
+
+
+def test_risk_record_token_ip():
+    """多网段判定：同 /24 不踢，跨公网网段才判定共享。"""
+    from api import risk_control as rc
+    rc.forget_token("tok-risk")
+    assert rc.record_token_ip("tok-risk", "192.168.1.10") is False        # 私网不计
+    assert rc.record_token_ip("tok-risk", "1.2.3.4") is False             # 首个公网网段
+    assert rc.record_token_ip("tok-risk", "1.2.3.200") is False           # 同 /24 → 正常
+    assert rc.record_token_ip("tok-risk", "5.6.7.8") is True              # 跨网段 → 共享
+    rc.forget_token("tok-risk")
+
+
 if __name__ == "__main__":
     test_normalize_client_type()
     test_get_max_devices()
@@ -241,4 +292,7 @@ if __name__ == "__main__":
     test_bind_and_evict_integration()
     test_unbind_and_kick_integration()
     test_check_session_integration()
+    test_trim_bindings_to_limit()
+    test_risk_ip_network_key()
+    test_risk_record_token_ip()
     print("ALL PASS")
