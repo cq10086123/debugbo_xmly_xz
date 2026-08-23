@@ -48,6 +48,8 @@ async function load() {
 
 async function generate() {
   if (gen.expiry_type === 'fixed' && !gen.expires_at) { toast.error('请选择到期时间'); return }
+  const md = Math.floor(Number(gen.max_devices))
+  if (!(md >= 1 && md <= 10)) { toast.error('设备数需在 1~10 之间'); return }
   gen.generating = true
   genResult.value = ''
   try {
@@ -61,7 +63,7 @@ async function generate() {
     if (gen.interface_names.length) payload.interface_names = [...gen.interface_names]
     if (gen.inject_xm_cookie) payload.inject_xm_cookie = true
     payload.download_mode = gen.download_mode
-    payload.max_devices = Number(gen.max_devices) || 1
+    payload.max_devices = md
     const r = await adminApi.post('/cards/generate', payload)
     if (r.data.success) {
       genResult.value = r.data.codes.join('\n')
@@ -108,11 +110,13 @@ function openBindEditor(c) {
 }
 
 async function saveBinding() {
+  const md = Math.floor(Number(bindEditor.max_devices))
+  if (!(md >= 1 && md <= 10)) { toast.error('设备数需在 1~10 之间'); return }
   bindEditor.saving = true
   try {
     const body = { interface_names: [...bindEditor.selected] }
     body.download_mode = bindEditor.download_mode
-    body.max_devices = Number(bindEditor.max_devices) || 1
+    body.max_devices = md
     const r = await adminApi.patch(`/cards/${bindEditor.card.id}`, body)
     if (r.data.success) {
       toast.success(bindEditor.selected.length ? '绑定已更新' : '已取消接口限制')
@@ -236,11 +240,7 @@ onMounted(() => { load(); loadInterfaces() })
           </select>
         </label>
         <label>设备数
-          <select v-model.number="gen.max_devices">
-            <option :value="1">1 台（网页/插件各 1）</option>
-            <option :value="2">2 台</option>
-            <option :value="3">3 台</option>
-          </select>
+          <input v-model.number="gen.max_devices" type="number" min="1" max="10" step="1" style="width:80px" title="每席位（网页/插件）允许绑定的设备数，1~10" />
         </label>
         <button class="success" :disabled="gen.generating" @click="generate">{{ gen.generating ? '生成中…' : '生成' }}</button>
       </div>
@@ -335,13 +335,8 @@ onMounted(() => { load(); loadInterfaces() })
           </select>
         </label>
         <label class="bind-item block">
-          绑定设备数（每席位）
-          <select v-model.number="bindEditor.max_devices">
-            <option :value="1">1 台（默认，网页/插件各 1）</option>
-            <option :value="2">2 台</option>
-            <option :value="3">3 台</option>
-            <option :value="5">5 台</option>
-          </select>
+          绑定设备数（每席位，1~10）
+          <input v-model.number="bindEditor.max_devices" type="number" min="1" max="10" step="1" style="width:80px" />
         </label>
         <div style="display:flex;gap:10px;margin-top:18px;justify-content:flex-end">
           <button class="ghost" @click="bindEditor.show=false">取消</button>
