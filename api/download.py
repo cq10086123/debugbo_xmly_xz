@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from core.downloader import XimalayaDownloader
 from core import config as _config
 from core import track_lock
+from core import download_slot
 from core import account_manager as _am
 from api.deps import get_current_card, ensure_interface_allowed, ensure_download_mode_allowed
 from api.persistence import persist_task, persist_record, load_tasks_from_db
@@ -31,6 +32,11 @@ router = APIRouter(prefix="/api/download", tags=["下载（官方引擎）"])
 # 启动从数据库恢复任务（标记 interrupted）
 _batch_tasks: dict[str, dict] = load_tasks_from_db("official")
 _sse_queues: set[asyncio.Queue] = set()
+
+# 单集/章节下载（/track /chapter）不在 _batch_tasks 里跟踪，
+# 单独登记其租约，供全局下载槽心跳循环续约（见 app._slot_maintenance_loop）。
+# job_id -> card_id
+_episode_jobs: dict[str, int] = {}
 
 
 def reload_tasks():
@@ -91,11 +97,28 @@ class BatchDownloadRequest(BaseModel):
 # ════════════════════════════════════════
 #  单集 / 章节 / 列表
 # ════════════════════════════════════════
+def _try_acquire_episode_job(card_id: int, holder_task_id: str):
+    """单集/章节下载抢全局下载槽。成功返回 holder_task_id，失败返回 409 响应。"""
+    acquired, holder = download_slot.acquire(
+        card_id, "server", holder_task_id,
+        ttl_seconds=download_slot.SERVER_TTL_SECONDS, source="official",
+    )
+    if not acquired:
+        return download_slot.busy_response(holder)
+    _episode_jobs[holder_task_id] = card_id
+    return holder_task_id
+
+
 @router.post("/track")
 async def download_track(req: TrackRequest, auth: dict = Depends(get_current_card)):
     ensure_interface_allowed(auth, "official")
+    card_id = auth["card_id"]
+    job_id = f"ep{uuid.uuid4().hex[:8]}"
+    guard = _try_acquire_episode_job(card_id, job_id)
+    if not isinstance(guard, str):
+        return guard
     try:
-        dl = _make_downloader(download_root=_config.DOWNLOAD_DIR / auth["code"], card_id=auth["card_id"])
+        dl = _make_downloader(download_root=_config.DOWNLOAD_DIR / auth["code"], card_id=card_id)
         result = await asyncio.to_thread(
             dl.download_by_track_id, req.track_id, req.quality,
             album_title=req.album_title, fmt=req.fmt, episode_num=req.episode_num
@@ -104,13 +127,21 @@ async def download_track(req: TrackRequest, auth: dict = Depends(get_current_car
     except Exception as e:
         logger.exception(f"{e}")
         return {"success": False, "error": str(e)}
+    finally:
+        _episode_jobs.pop(job_id, None)
+        download_slot.release(card_id, job_id)
 
 
 @router.post("/chapter")
 async def download_chapter(req: ChapterRequest, auth: dict = Depends(get_current_card)):
     ensure_interface_allowed(auth, "official")
+    card_id = auth["card_id"]
+    job_id = f"ep{uuid.uuid4().hex[:8]}"
+    guard = _try_acquire_episode_job(card_id, job_id)
+    if not isinstance(guard, str):
+        return guard
     try:
-        dl = _make_downloader(download_root=_config.DOWNLOAD_DIR / auth["code"], card_id=auth["card_id"])
+        dl = _make_downloader(download_root=_config.DOWNLOAD_DIR / auth["code"], card_id=card_id)
         result = await asyncio.to_thread(
             dl.download_by_chapter, req.album_id, req.chapter_num, req.quality, fmt=req.fmt
         )
@@ -118,6 +149,9 @@ async def download_chapter(req: ChapterRequest, auth: dict = Depends(get_current
     except Exception as e:
         logger.exception(f"{e}")
         return {"success": False, "error": str(e)}
+    finally:
+        _episode_jobs.pop(job_id, None)
+        download_slot.release(card_id, job_id)
 
 
 @router.post("/album-list")
@@ -433,6 +467,12 @@ async def _run_batch_task(task_id: str, album_id: int, quality: int,
                 persist_task(task)
             except Exception:
                 pass
+        # 全局下载槽：任务终止时释放（所有权校验——槽若已被管理员强释或他人抢占，
+        # 此处为空操作，绝不误删新锁）
+        try:
+            download_slot.release(card_id, task_id)
+        except Exception:
+            logger.exception("释放下载槽失败")
         dl.close()
 
 
@@ -456,6 +496,15 @@ async def start_batch_download(req: BatchDownloadRequest, auth: dict = Depends(g
         _acc = _am.get_account_info(card_id, req.account_id)
         if _acc:
             account_nickname = _acc.get("nickname", "")
+
+    # 全局下载槽：同一卡密已有任一下载进行中（本地插件或服务器任务）→ 409
+    acquired, holder = download_slot.acquire(
+        card_id, "server", task_id,
+        ttl_seconds=download_slot.SERVER_TTL_SECONDS,
+        source="official", album_id=str(req.album_id),
+    )
+    if not acquired:
+        return download_slot.busy_response(holder)
 
     _batch_tasks[task_id] = {
         "task_id": task_id,
@@ -622,6 +671,12 @@ async def cancel_batch_download(task_id: str, auth: dict = Depends(get_current_c
         return {"success": False, "error": "任务不存在"}
     task["cancelled"] = True
     task["status"] = "cancelling"
+    # 立即释放全局下载槽：用户明确取消后不必等当前集收尾即可开始下一本。
+    # 旧协程收尾时的 release 带所有权校验，槽已被新任务持有时为空操作。
+    try:
+        download_slot.release(task.get("card_id"), task_id)
+    except Exception:
+        logger.exception("取消时释放下载槽失败")
     return {"success": True, "message": "正在取消..."}
 
 
@@ -635,6 +690,16 @@ async def resume_batch_download(task_id: str, auth: dict = Depends(get_current_c
     if status in ("running", "cancelling"):
         return {"success": False, "error": "任务正在运行中"}
 
+    # 恢复 = 重新创建下载：必须先抢回全局下载槽（重启后槽可能被本地任务或其他服务器任务持有）
+    acquired, holder = download_slot.acquire(
+        task["card_id"], "server", task_id,
+        ttl_seconds=download_slot.SERVER_TTL_SECONDS,
+        source=task.get("interface_name") or "official",
+        album_id=str(task.get("album_id")) if task.get("album_id") is not None else None,
+    )
+    if not acquired:
+        return download_slot.busy_response(holder)
+
     task["status"] = "running"
     task["error"] = ""
     task["cancelled"] = False
@@ -642,18 +707,30 @@ async def resume_batch_download(task_id: str, auth: dict = Depends(get_current_c
     task["started_at"] = time.time()
     task["failed_list"] = []
 
-    dl = XimalayaDownloader(account_id=task.get("account_id") or None,
-                            card_id=task.get("card_id"), download_root=task["download_root"])
     try:
-        album_title = task.get("album_title", "")
-        if album_title:
-            existing_files = await asyncio.to_thread(dl.scan_local_album, album_title)
-            task["completed"] = len(existing_files)
-            task["skipped_count"] = 0
-    finally:
-        dl.close()
+        dl = XimalayaDownloader(account_id=task.get("account_id") or None,
+                                card_id=task.get("card_id"), download_root=task["download_root"])
+        try:
+            album_title = task.get("album_title", "")
+            if album_title:
+                existing_files = await asyncio.to_thread(dl.scan_local_album, album_title)
+                task["completed"] = len(existing_files)
+                task["skipped_count"] = 0
+        finally:
+            dl.close()
 
-    persist_task(task)
+        persist_task(task)
+    except Exception:
+        # 恢复流程中途失败：回滚任务状态并释放已抢到的下载槽，避免槽被空占 2 分钟
+        task["status"] = "interrupted"
+        task["cancelled"] = True
+        try:
+            persist_task(task)
+        except Exception:
+            pass
+        download_slot.release(task.get("card_id"), task_id)
+        raise
+
     end_ep = task.get("end_episode") or 999999
     asyncio.create_task(_run_batch_task(task_id, task["album_id"], task.get("quality", 0),
                                         task.get("start_episode", 1), end_ep, task.get("fmt", "mp3"),
@@ -661,14 +738,30 @@ async def resume_batch_download(task_id: str, auth: dict = Depends(get_current_c
     return {"success": True, "task_id": task_id, "message": "已恢复下载"}
 
 
-def _start_retry_task(task: dict) -> str | None:
+def _start_retry_task(task: dict) -> tuple[str | None, str]:
+    """启动失败集重试子任务。返回 (子任务 id, 原因)。
+
+    原因：ok | nothing_to_retry | already_retrying | slot_busy。
+    重试子任务是一次新的服务器下载，必须先抢到全局下载槽；
+    槽被占用（如本地插件正在下载）时不置 retry_started，调用方稍后重试即可。
+    """
     failed_list = task.get("failed_list", [])
     if not failed_list or task.get("retry_started"):
-        return None
+        return None, ("already_retrying" if task.get("retry_started") else "nothing_to_retry")
     retry_episodes = sorted({f["episode"] for f in failed_list})
+    new_task_id = str(uuid.uuid4())[:8]
+
+    acquired, holder = download_slot.acquire(
+        task.get("card_id"), "server", new_task_id,
+        ttl_seconds=download_slot.SERVER_TTL_SECONDS,
+        source=task.get("interface_name") or "official",
+        album_id=str(task.get("album_id")) if task.get("album_id") is not None else None,
+    )
+    if not acquired:
+        return None, "slot_busy"
+
     task["retry_started"] = True
 
-    new_task_id = str(uuid.uuid4())[:8]
     _batch_tasks[new_task_id] = {
         "task_id": new_task_id,
         "card_id": task["card_id"],
@@ -702,7 +795,7 @@ def _start_retry_task(task: dict) -> str | None:
     asyncio.create_task(_run_batch_task(new_task_id, task["album_id"], task["quality"],
                                         retry_episodes[0], retry_episodes[-1], task.get("fmt", "mp3"),
                                         account_id=task.get("account_id")))
-    return new_task_id
+    return new_task_id, "ok"
 
 
 _auto_retry_loops: set[str] = set()
@@ -752,7 +845,12 @@ async def _auto_retry_loop(task_id: str):
                 task = _batch_tasks.get(task_id)
             if not task or task.get("cancelled") or not task.get("failed_list"):
                 break
-            child_id = _start_retry_task(task)
+            child_id, reason = _start_retry_task(task)
+            if reason == "slot_busy":
+                # 全局下载槽被本地插件/其他任务占用：不能 break（否则自动重试永久终止），
+                # 保留失败集，等下一轮间隔后再试
+                logger.info(f"任务 {task_id} 自动重试第 {round_no} 轮暂缓：下载槽被占用，下一轮再试")
+                continue
             if not child_id:
                 break
             logger.info(f"任务 {task_id} 自动重试第 {round_no} 轮，子任务 {child_id}，"
@@ -802,8 +900,10 @@ async def retry_batch_failed(task_id: str, auth: dict = Depends(get_current_card
         return {"success": False, "error": "没有失败项需要重试"}
     if task.get("retry_started"):
         return {"success": False, "error": "已有重试任务在进行中，请等待完成"}
-    new_task_id = _start_retry_task(task)
+    new_task_id, reason = _start_retry_task(task)
     if not new_task_id:
+        if reason == "slot_busy":
+            return download_slot.busy_response(download_slot.get_lock(task.get("card_id")))
         return {"success": False, "error": "无法创建重试任务"}
     persist_task(task)
     return {"success": True, "task_id": new_task_id, "retry_count": len(failed_list)}

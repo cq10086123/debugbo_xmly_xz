@@ -36,6 +36,7 @@ from core.interface_manager import (
 )
 from core.batch_runner import run_generic_batch
 from core import config as _config
+from core import download_slot
 from api.deps import get_current_admin, get_current_card, ensure_interface_allowed, ensure_download_mode_allowed
 from db.session import SessionLocal
 from db.models import Interface
@@ -469,6 +470,14 @@ async def intf_batch(name: str, req: BatchRequest, auth: dict = Depends(get_curr
     card_id = auth["card_id"]
     download_root = str(_config.DOWNLOAD_DIR / auth["code"])
     task_id = str(uuid.uuid4())[:8]
+    # 全局下载槽：同一卡密已有任一下载进行中（本地插件或服务器任务）→ 409
+    acquired, holder = download_slot.acquire(
+        card_id, "server", task_id,
+        ttl_seconds=download_slot.SERVER_TTL_SECONDS,
+        source=name, album_id=str(req.book_id),
+    )
+    if not acquired:
+        return download_slot.busy_response(holder)
     _intf_tasks[task_id] = {
         "task_id": task_id, "card_id": card_id, "interface": name,
         "download_root": download_root, "engine": name, "book_id": req.book_id,
@@ -540,6 +549,11 @@ async def cancel_intf_task(task_id: str, auth: dict = Depends(get_current_card))
         return {"success": False, "error": "任务不存在"}
     task["cancelled"] = True
     task["status"] = "cancelling"
+    # 立即释放全局下载槽（同官方批量取消语义：取消后即可开始下一本）
+    try:
+        download_slot.release(task.get("card_id"), task_id)
+    except Exception:
+        logger.exception("取消时释放下载槽失败")
     return {"success": True, "message": "正在取消..."}
 
 

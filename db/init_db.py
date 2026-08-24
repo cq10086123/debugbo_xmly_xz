@@ -37,6 +37,7 @@ def init_db():
     _migrate_session_columns()
     _migrate_backend_columns()
     _migrate_backend_xm_columns()
+    _migrate_local_task_columns()
     _migrate_config_json()
     _migrate_accounts_json()
     _ensure_default_admin()
@@ -115,6 +116,37 @@ def _migrate_backend_xm_columns():
             if name not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE backend_xm_accounts ADD COLUMN {name} {ddl}")
                 logger.info(f"backend_xm_accounts 表补充列: {name}")
+        conn.commit()
+
+
+def _migrate_local_task_columns():
+    """轻量迁移：为已存在的 local_tasks 表补充下载槽租约相关列（全部可空，存量任务不受影响）。
+
+    - claim_id      TEXT     本次 claim 凭证
+    - progress      TEXT     JSON {total, done, failed}
+    - failed_list   TEXT     JSON 失败集列表
+    - error         TEXT     错误/提示
+    - claimed_at    DATETIME
+    - heartbeat_at  DATETIME
+    - lease_until   DATETIME
+    - finished_at   DATETIME
+    """
+    needed = {
+        "claim_id": "TEXT",
+        "progress": "TEXT",
+        "failed_list": "TEXT",
+        "error": "TEXT",
+        "claimed_at": "DATETIME",
+        "heartbeat_at": "DATETIME",
+        "lease_until": "DATETIME",
+        "finished_at": "DATETIME",
+    }
+    with _engine.connect() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(local_tasks)").fetchall()}
+        for name, ddl in needed.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE local_tasks ADD COLUMN {name} {ddl}")
+                logger.info(f"local_tasks 表补充列: {name}")
         conn.commit()
 
 

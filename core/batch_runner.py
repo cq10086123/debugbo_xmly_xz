@@ -283,4 +283,10 @@ async def run_generic_batch(
         except Exception:  # noqa: BLE001
             pass
     finally:
-        pass
+        # 全局下载槽：任务终止时释放（所有权校验——槽若已被管理员强释或他人抢占，
+        # 此处为空操作，绝不误删新锁）
+        try:
+            from core import download_slot
+            download_slot.release(card_id, task.get("task_id"))
+        except Exception:  # noqa: BLE001
+            logger.exception("释放下载槽失败")
