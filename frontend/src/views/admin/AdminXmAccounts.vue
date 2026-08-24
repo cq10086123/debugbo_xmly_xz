@@ -6,6 +6,8 @@ import { useToast } from '../../utils/toast'
 const toast = useToast()
 const backendAccounts = ref([])
 const loading = ref(false)
+const verifyingAll = ref(false)
+const verifyingId = ref(null)
 
 // 后端扫码登录二维码弹窗
 const qrModal = reactive({ show: false, img: '', qrId: '', checking: false })
@@ -105,6 +107,45 @@ async function revoke() {
   } catch (e) { toast.error(e.response?.data?.detail || '撤销失败') }
 }
 
+async function verifyOne(id) {
+  verifyingId.value = id
+  try {
+    const r = await adminApi.post(`/xm-login/accounts/${id}/verify`)
+    if (r.data.success) {
+      if (r.data.is_valid) {
+        toast.success(`${r.data.nickname || r.data.id} Cookie 有效 (VIP: ${r.data.is_vip ? '是' : '否'})`)
+      } else {
+        toast.error(`${r.data.id} ${r.data.error || 'Cookie 已失效'}`)
+      }
+      loadBackendAccounts()
+    } else toast.error(r.data.error || '验证失败')
+  } catch (e) { toast.error('验证失败') }
+  verifyingId.value = null
+}
+
+async function verifyAll() {
+  if (verifyingAll.value) return
+  verifyingAll.value = true
+  try {
+    const r = await adminApi.post('/xm-login/accounts/verify-all')
+    if (r.data.success) {
+      toast.success(`验证完成: ${r.data.valid} 有效 / ${r.data.invalid} 失效 (共 ${r.data.total})`)
+      loadBackendAccounts()
+    } else toast.error('验证失败')
+  } catch (e) { toast.error('验证失败') }
+  verifyingAll.value = false
+}
+
+function statusLabel(acc) {
+  if (acc.is_valid === null || acc.is_valid === undefined) return '未验证'
+  return acc.is_valid ? '有效' : '失效'
+}
+
+function statusClass(acc) {
+  if (acc.is_valid === null || acc.is_valid === undefined) return 'pending'
+  return acc.is_valid ? 'active' : 'disabled'
+}
+
 onMounted(() => { loadBackendAccounts() })
 onUnmounted(() => { stopPoll() })
 </script>
@@ -113,17 +154,21 @@ onUnmounted(() => { stopPoll() })
   <div>
     <!-- 后端供体账号池 -->
     <div class="card-panel pad">
-      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap">
         <h3 style="margin:0">🍪 后端喜马拉雅供体账号池</h3>
         <button class="success" @click="openQr">+ 扫码登录后端账号</button>
+        <button class="ghost" :disabled="verifyingAll || !backendAccounts.length" @click="verifyAll">
+          {{ verifyingAll ? '验证中…' : '🔍 批量验证全部' }}
+        </button>
       </div>
       <p class="muted" style="margin:0 0 14px;font-size:13px">
         在后台扫码登录的喜马拉雅账号暂存于此，仅作「供体」被复制进卡密，绝不直接用于下载。
+        供体 cookie 更新时会自动级联刷新已注入的副本。
       </p>
       <div v-if="loading" class="empty-state">加载中…</div>
       <table v-else-if="backendAccounts.length" class="tbl">
         <thead>
-          <tr><th>ID</th><th>昵称</th><th>UID</th><th>VIP</th><th>手机号</th><th>添加时间</th><th>操作</th></tr>
+          <tr><th>ID</th><th>昵称</th><th>UID</th><th>VIP</th><th>手机号</th><th>状态</th><th>最后验证</th><th>操作</th></tr>
         </thead>
         <tbody>
           <tr v-for="b in backendAccounts" :key="b.id">
@@ -132,8 +177,14 @@ onUnmounted(() => { stopPoll() })
             <td class="mono">{{ b.uid || '—' }}</td>
             <td><span class="tag" :class="b.is_vip ? 'used' : 'disabled'">{{ b.is_vip ? 'VIP' : '普通' }}</span></td>
             <td class="mono">{{ b.mobile || '—' }}</td>
-            <td class="muted">{{ b.added_at || '—' }}</td>
-            <td class="ops"><a class="del" @click="delBackend(b.id)">删除</a></td>
+            <td><span class="tag" :class="statusClass(b)">{{ statusLabel(b) }}</span></td>
+            <td class="muted" style="font-size:12px">{{ b.last_verified_at || '—' }}</td>
+            <td class="ops">
+              <a class="verify" @click="verifyOne(b.id)" :class="{ 'verifying': verifyingId === b.id }">
+                {{ verifyingId === b.id ? '验证中' : '验证' }}
+              </a>
+              <a class="del" @click="delBackend(b.id)">删除</a>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -198,10 +249,18 @@ onUnmounted(() => { stopPoll() })
 .mono { font-family: monospace; letter-spacing: .5px; }
 .ops { display: flex; gap: 10px; flex-wrap: wrap; }
 .ops a { cursor: pointer; }
+.ops .verify { color: var(--accent, #3b82f6); }
+.ops .verify.verifying { color: var(--text-dim); pointer-events: none; }
 .ops .del { color: var(--danger); }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 500; }
+.tag.active { background: #10b981; color: #fff; }
+.tag.pending { background: #f59e0b; color: #fff; }
+.tag.disabled { background: #ef4444; color: #fff; }
+.tag.used { background: #8b5cf6; color: #fff; }
 .result { text-align: left; background: var(--bg-soft); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 12px; margin-top: 14px; overflow: auto; max-height: 280px; }
 .qr-wrap { display: flex; justify-content: center; margin: 10px 0 14px; }
 .qr { width: 220px; height: 220px; background: #fff; border-radius: 10px; object-fit: contain; }
 .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; z-index: 100; }
 .modal { width: 360px; max-width: 92vw; padding: 22px; }
+button:disabled { opacity: .5; cursor: not-allowed; }
 </style>

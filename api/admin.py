@@ -5,6 +5,7 @@
 路由前缀由 app.py 启动时按 api_config.admin_path 动态挂载，本文件不带前缀。
 """
 
+import asyncio
 import logging
 import re
 import secrets
@@ -685,6 +686,20 @@ async def delete_backend_xm_account(account_id: int, _: bool = Depends(get_curre
     if _am.remove_backend_account(account_id):
         return {"success": True, "message": "已删除"}
     raise HTTPException(status_code=404, detail="账号不存在")
+
+
+@router.post("/xm-login/accounts/verify-all")
+async def verify_all_backend_xm_accounts(_: bool = Depends(get_current_admin)):
+    """批量验证供体池全部账号的 cookie 有效性"""
+    result = await asyncio.to_thread(_am.verify_all_backend_accounts)
+    return {"success": True, **result}
+
+
+@router.post("/xm-login/accounts/{account_id}/verify")
+async def verify_backend_xm_account(account_id: int, _: bool = Depends(get_current_admin)):
+    """验证单个供体账号的 cookie 有效性"""
+    result = await asyncio.to_thread(_am.verify_backend_account, account_id)
+    return {"success": True, **result}
 
 
 # ════════════════════════════════════════
