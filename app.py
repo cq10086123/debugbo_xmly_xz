@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import socket
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -34,7 +35,8 @@ from core.config import ensure_dirs, HOST, PORT, get_admin_path, get_admin_lan_o
 from db.init_db import init_db
 from db.session import SessionLocal
 from core.interface_manager import manager as iface_manager
-from db.models import Card
+from core import download_slot
+from db.models import Card, LocalTask
 from api.card_helpers import is_expired, mark_expired
 from api.persistence import clear_card_data
 from api.download import router as download_router, resume_interrupted_auto_retries as _resume_off, reload_tasks as _reload_off
@@ -72,10 +74,58 @@ async def _card_expiry_loop():
                             if t.get("card_id") == card.id and t.get("status") not in ("done", "failed", "cancelled"):
                                 t["cancelled"] = True
                                 t["status"] = "cancelling"
+                    # 全局下载槽：过期卡释放其锁，本地下载任务置 cancelled（卡已不可用）
+                    download_slot.force_release(card.id)
+                    now = datetime.now(timezone.utc).replace(tzinfo=None)
+                    for lt in db.query(LocalTask).filter_by(card_id=card.id, status="running").all():
+                        lt.status = "cancelled"
+                        lt.finished_at = now
+                        lt.claim_id = None
+                        lt.lease_until = None
+                        lt.error = "卡密已过期，任务已取消"
+                    db.commit()
         except Exception as e:
             logger.exception(f"卡密过期扫描异常: {e}")
         finally:
             db.close()
+
+
+async def _slot_maintenance_loop(interval: int = 30):
+    """全局下载槽维护循环（30s 一拍）：
+
+    1. 为进程内仍在运行的服务器下载任务（官方批量 / 第三方批量 / 单集）续约租约；
+    2. 租约过期的本地任务（插件侧心跳已断）回退为 pending，重新可被 claim；
+    3. 物理清理过期锁行（表卫生）。
+
+    注意：循环只「续约」，绝不重新 acquire —— 管理员强制释放后不能把槽抢回来。
+    """
+    from api.download import _batch_tasks, _episode_jobs
+    from api.interfaces import _intf_tasks
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            running: list[tuple[int, str]] = []
+            for tasks in (_batch_tasks, _intf_tasks):
+                for t in list(tasks.values()):
+                    if t.get("status") in ("running", "cancelling"):
+                        running.append((t.get("card_id"), t.get("task_id")))
+            for job_id, card_id in list(_episode_jobs.items()):
+                running.append((card_id, job_id))
+            for card_id, task_id in running:
+                if card_id is None or not task_id:
+                    continue
+                ok, _ = download_slot.heartbeat(card_id, task_id,
+                                                ttl_seconds=download_slot.SERVER_TTL_SECONDS)
+                if not ok:
+                    logger.debug(f"下载槽心跳未生效（可能已被释放）: card={card_id} task={task_id}")
+            swept = download_slot.sweep_expired_local_tasks()
+            if swept:
+                logger.info(f"{swept} 个本地下载任务因租约过期回退为 pending")
+            download_slot.expire_stale()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("下载槽维护循环异常")
 
 
 @asynccontextmanager
@@ -83,6 +133,8 @@ async def lifespan(app: FastAPI):
     ensure_dirs()
     init_db()
     logger.info(f"管理后台 API 挂载于 /api/{app.state.admin_path}（仅局域网可访问）")
+    # 服务器重启 ⇒ 进程内任务全部消亡 ⇒ 清理服务器下载遗留锁（本地插件锁保留）
+    download_slot.cleanup_on_startup()
     # 建表并注入默认接口后，加载接口到管理器缓存
     iface_manager.reload_all()
     # 建表后重新加载上次运行的任务（标记 interrupted）
@@ -91,6 +143,8 @@ async def lifespan(app: FastAPI):
     _resume_off()
     # 启动卡密过期清理后台任务
     asyncio.create_task(_card_expiry_loop())
+    # 启动全局下载槽维护（服务器任务心跳 + 本地任务租约清扫）
+    asyncio.create_task(_slot_maintenance_loop())
     logger.info("应用启动完成")
     yield
 

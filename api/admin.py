@@ -48,7 +48,7 @@ def _admin_register_fail(ip: str) -> None:
 
 from db.session import SessionLocal
 from db.models import (
-    Admin, AdminToken, Card, ApiConfig, Interface, LocalTask,
+    Admin, AdminToken, Card, ApiConfig, Interface, LocalTask, CardDownloadLock,
     Session as CardSession,
 )
 from api.deps import get_current_admin
@@ -463,7 +463,9 @@ async def delete_card(card_id: int, _: bool = Depends(get_current_admin)):
 
     注意：local_tasks（浏览器插件本地下载任务）未纳入 Card 的 ORM 级联关系，
     但表上有 card_id 外键约束；若不显式清理，删除带插件任务的卡密会因外键冲突返回 500。
-    故此处先删除 local_tasks，再删除卡密本体。
+    同理 card_download_locks（全局下载锁）虽定义了 ON DELETE CASCADE，仍显式清理兜底
+    （防止旧库/异常环境 FK pragma 未生效）。
+    故此处先删除 local_tasks 与下载锁，再删除卡密本体。
     """
     db = SessionLocal()
     try:
@@ -471,6 +473,7 @@ async def delete_card(card_id: int, _: bool = Depends(get_current_admin)):
         if not card:
             raise HTTPException(status_code=404, detail="卡密不存在")
         db.query(LocalTask).filter_by(card_id=card.id).delete(synchronize_session=False)
+        db.query(CardDownloadLock).filter_by(card_id=card.id).delete(synchronize_session=False)
         db.delete(card)  # 级联删除 sessions / devices / tasks / records / accounts
         db.commit()
         return {"success": True, "message": "已删除"}
@@ -559,6 +562,68 @@ async def kick_card_sessions(card_id: int, _: bool = Depends(get_current_admin))
         n = dvb.kick_all_sessions(db, card)
         db.commit()
         return {"success": True, "message": f"已踢下线 {n} 个会话（设备绑定保留）", "kicked": n}
+    finally:
+        db.close()
+
+
+# ════════════════════════════════════════
+#  全局下载槽排障（查看 / 强制释放）
+# ════════════════════════════════════════
+@router.get("/download-locks")
+async def list_download_locks(_: bool = Depends(get_current_admin)):
+    """列出当前所有卡密下载锁（本地插件 / 服务器任务，含过期标记），用于排障。"""
+    from core import download_slot
+    locks = download_slot.list_locks()
+    return {"success": True, "count": len(locks), "locks": locks}
+
+
+@router.post("/cards/{card_id}/download-lock/release")
+async def force_release_download_lock(card_id: int, _: bool = Depends(get_current_admin)):
+    """强制释放卡密下载锁。
+
+    副作用（保证释放后状态一致，而不是"锁没了但任务还在跑"）：
+    - holder 是本地任务 → 该任务回退为 pending（插件下次心跳会被 409 拒绝，本地下载停止）；
+    - holder 是服务器任务 → 置 cancelled/cancelling，让其在当前集收尾后真正停掉。
+    """
+    from core import download_slot
+    from db.models import LocalTask
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(id=card_id).first()
+        if not card:
+            raise HTTPException(status_code=404, detail="卡密不存在")
+        holder = download_slot.force_release(card_id)
+        if holder is None:
+            return {"success": True, "message": "该卡密当前没有下载锁", "holder": None}
+
+        if holder["holder_type"] == "local":
+            t = db.query(LocalTask).filter_by(task_id=holder["task_id"], card_id=card_id).first()
+            if t is not None and t.status == "running":
+                t.status = "pending"
+                t.claim_id = None
+                t.claimed_at = None
+                t.heartbeat_at = None
+                t.lease_until = None
+                t.error = "下载锁被管理员强制释放，任务已重新排队"
+                db.commit()
+            action = f"已释放本地下载锁，任务 {holder['task_id']} 已重新排队"
+        else:
+            action = f"已释放服务器下载锁（任务 {holder['task_id']}）"
+
+        # 服务器任务若仍在进程内运行，必须真正停掉：否则它不再持槽却继续写盘，
+        # 会破坏"同一卡密只有一个下载"的语义
+        stopped: list[str] = []
+        if holder["holder_type"] == "server":
+            from api.download import _batch_tasks
+            from api.interfaces import _intf_tasks
+            for tasks in (_batch_tasks, _intf_tasks):
+                t = tasks.get(holder["task_id"])
+                if t is not None and t.get("status") in ("running", "cancelling"):
+                    t["cancelled"] = True
+                    t["status"] = "cancelling"
+                    stopped.append(holder["task_id"])
+        log_card_event("force_release_download_lock", card_id, f"管理员强制释放下载锁：{action}")
+        return {"success": True, "message": action, "holder": holder, "stopped_server_tasks": stopped}
     finally:
         db.close()
 

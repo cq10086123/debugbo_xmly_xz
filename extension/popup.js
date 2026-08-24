@@ -296,11 +296,13 @@ $('tasks').addEventListener('click', async (e) => {
   }
   btn.disabled = true
   try {
-    if (action === 'pause') await swCall('pauseTask', { taskId })
-    else if (action === 'resume') await swCall('resumeTask', { taskId })
-    else if (action === 'cancel') await swCall('cancelTask', { taskId })
-    else if (action === 'retry') await swCall('retryFailed', { taskId })
-    else if (action === 'start') await swCall('startTask', { taskId })
+    let res = null
+    if (action === 'pause') res = await swCall('pauseTask', { taskId })
+    else if (action === 'resume') res = await swCall('resumeTask', { taskId })
+    else if (action === 'cancel') res = await swCall('cancelTask', { taskId })
+    else if (action === 'retry') res = await swCall('retryFailed', { taskId })
+    else if (action === 'start') res = await swCall('startTask', { taskId })
+    if (res && res.queued) setMsg(res.message || '已加入队列，当前下载完成后自动开始', 'ok')
     await renderQueue()
   } catch (err) { setMsg('操作失败：' + err.message, 'err') }
 })
@@ -374,17 +376,18 @@ async function renderQueue() {
 
     const statusText = t.status === 'done' ? '已完成'
       : t.status === 'cancelled' ? '已取消'
+      : t.frozen ? '其他设备下载中'
       : t.paused ? '已暂停'
       : t.status === 'running' ? (t.task_id === activeBookId ? '下载中' : '排队中')
       : '待处理'
 
-    // 操作按钮
+    // 操作按钮（frozen=其他设备持有下载槽：本设备只能取消本地展示，不能控制下载）
     let actions = ''
     if (t.status === 'pending') actions += `<button class="mini" data-action="start" data-task-id="${t.task_id}">▶ 开始下载</button>`
-    if (t.status === 'running' && !t.paused) actions += `<button class="mini" data-action="pause" data-task-id="${t.task_id}">⏸ 暂停</button>`
-    if (t.paused) actions += `<button class="mini" data-action="resume" data-task-id="${t.task_id}">▶ 继续</button>`
+    if (t.status === 'running' && !t.paused && !t.frozen) actions += `<button class="mini" data-action="pause" data-task-id="${t.task_id}">⏸ 暂停</button>`
+    if (t.paused && !t.frozen) actions += `<button class="mini" data-action="resume" data-task-id="${t.task_id}">▶ 继续</button>`
     if (t.status !== 'done' && t.status !== 'cancelled') actions += `<button class="mini danger" data-action="cancel" data-task-id="${t.task_id}">✕ 取消</button>`
-    if (failed > 0 && t.status !== 'cancelled') actions += `<button class="mini" data-action="retry" data-task-id="${t.task_id}">↻ 重试失败(${failed})</button>`
+    if (failed > 0 && t.status !== 'cancelled' && !t.frozen) actions += `<button class="mini" data-action="retry" data-task-id="${t.task_id}">↻ 重试失败(${failed})</button>`
 
     // 单集明细：默认折叠（上千集不撑爆弹窗），点「展开明细」查看；
     // 展开状态存在 expandedTasks，1.5s 自动刷新重建 DOM 不会丢。
@@ -409,6 +412,7 @@ async function renderQueue() {
       <div class="task-head"><b>${escapeHtml(t.album_title || ('专辑 ' + t.album_id))}</b><span class="muted"> · ${escapeHtml(t.source)} · ${statusText}</span></div>
       <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
       <div class="muted">${done}/${total} 完成 · ${failed} 失败 · ${downloading} 下载中${resolvingText} · ${pending} 待处理 · ${pct}%</div>
+      ${t.errorMsg ? `<div class="err">${escapeHtml(t.errorMsg)}</div>` : ''}
       <div class="actions">${actions}</div>
       ${tracksHtml}
     `

@@ -131,6 +131,7 @@ function upsertIndexEntry(idx, task) {
     source: task.source,
     status: task.status,
     paused: !!task.paused,
+    frozen: !!task.frozen,   // 被其他设备 claim 的展示态任务（本地不下载）
     createdAt: task.createdAt || Date.now(),
   }
   if (i >= 0) idx[i] = { ...idx[i], ...entry }
@@ -306,17 +307,305 @@ async function updateTrack(taskId, trackId, patch) {
   maybeStopKeepAlive()
 }
 
+// ════════════════════════════════════════
+//  全局下载槽（0.7.0）：claim → heartbeat → complete/cancel
+//  同一卡密全局只允许一个任务真正下载；claimState 持久化到 chrome.storage，
+//  SW 被杀重启后可恢复租约，避免每次重启都走一遍"租约过期→重新排队"。
+// ════════════════════════════════════════
+const STORAGE_CLAIM = 'xm_claim'
+let claimState = null          // {taskId, claimId, leaseSeconds, lastBeatAt, beatFails}
+let claimPending = false       // 用户显式请求（全部下载/开始）尚未兑现
+let claimQueue = []            // 槽忙时排队的显式 claim（开始/重试失败集），FIFO
+let lastServerTasks = []       // 最近一次 GET /tasks（pending+running），claim 失效时重新同步用
+const SERVER_BEAT_INTERVAL_MS = 30 * 1000    // 心跳节流间隔（alarm 1 分钟兜底 + 进度事件随路）
+// 连续心跳不可达 N 次 ⇒ 停止本地下载。租约 300s、心跳最慢 60s/次（alarm），
+// N=3 ⇒ 约 90~180s 不可达即停：此时服务器侧租约多半已过期并可能把任务重新排队，
+// 继续下载就会与"重新 claim 本任务的其他设备"并行落盘（全局槽的核心目标正是要防止这个）。
+const BEAT_COMM_FAIL_LIMIT = 3
+
+// 服务端判定 claim 失效（cookie/冷却接口被拒等），runTrack 捕获后停止整个任务
+class ClaimLostError extends Error {}
+
+// 统一服务端请求：拼 URL/鉴权头，401 统一走 handleUnauthorized
+async function serverApi(path, { method = 'GET', body, params } = {}) {
+  const { serverUrl, token } = await cfg()
+  if (!serverUrl || !token) return { ok: false, status: 0, data: null }
+  let url = serverUrl + path
+  if (params) {
+    const qs = Object.entries(params)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '')
+      .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&')
+    if (qs) url += '?' + qs
+  }
+  const headers = { Authorization: 'Bearer ' + token }
+  if (body) headers['Content-Type'] = 'application/json'
+  const r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined })
+  let data = null
+  try { data = await r.json() } catch (e) {}
+  if (r.status === 401) {
+    await handleUnauthorized((data && data.detail) || '登录已失效，请重新登录')
+    return { ok: false, status: 401, data }
+  }
+  return { ok: r.ok, status: r.status, data }
+}
+
+async function loadClaimState() {
+  const o = await new Promise(r => chrome.storage.local.get([STORAGE_CLAIM], o => r(o)))
+  claimState = o[STORAGE_CLAIM] || null
+  if (claimState) console.log('[plugin] 恢复 claim 状态', claimState.taskId)
+}
+async function saveClaimState() {
+  await new Promise(r => chrome.storage.local.set({ [STORAGE_CLAIM]: claimState }, r))
+}
+async function clearClaimState() {
+  claimState = null
+  await new Promise(r => chrome.storage.local.remove([STORAGE_CLAIM], r))
+}
+
+// claim 一本书（指定 task_id 或让服务端选最早的 pending）
+async function claimTask(taskId) {
+  const path = taskId
+    ? `/api/extension/tasks/${encodeURIComponent(taskId)}/claim`
+    : '/api/extension/tasks/claim'
+  let res
+  try {
+    res = await serverApi(path, { method: 'POST', body: {} })
+  } catch (e) {
+    return { error: '无法连接服务器: ' + e.message }
+  }
+  if (res.status === 409) return { busy: true, holder: res.data && res.data.holder }
+  if (!res.ok || !res.data || !res.data.success) {
+    return { error: (res.data && (res.data.error || res.data.detail)) || `claim 失败 (${res.status})` }
+  }
+  const claimed = res.data.task
+  if (!claimed || !claimed.task_id || !claimed.claim_id) {
+    return { error: 'claim 响应异常（缺少 task/claim_id）' }
+  }
+  // 合并进本地任务：保留本地已完成/下载中的 track 状态（SW 重启续传 / 重 claim 场景）
+  await withQueue(async () => {
+    const old = await getTask(claimed.task_id)
+    const tracks = (claimed.tracks || []).map(tr => {
+      const ot = old && old.tracks
+        ? old.tracks.find(x => String(x.track_id) === String(tr.track_id)) : null
+      if (ot && ot.status !== 'pending') {
+        return { ...tr, status: ot.status, downloadId: ot.downloadId || null,
+                 filename: ot.filename || null, error: ot.error || '' }
+      }
+      return { ...tr, status: 'pending', error: '', downloadId: null }
+    })
+    const newTask = {
+      ...claimed,
+      tracks,
+      status: 'running',
+      paused: false,
+      frozen: false,
+      claim_id: claimed.claim_id,
+      errorMsg: '',
+      createdAt: (old && old.createdAt) || Date.now(),
+    }
+    recomputeProgress(newTask)
+    const idx = await getIndex()
+    await setTask(newTask)
+    upsertIndexEntry(idx, newTask)
+    await setIndex(idx)
+  })
+  claimState = {
+    taskId: claimed.task_id,
+    claimId: claimed.claim_id,
+    leaseSeconds: claimed.lease_seconds || 300,
+    lastBeatAt: Date.now(),
+    beatFails: 0,
+  }
+  await saveClaimState()
+  console.log('[plugin] claim 成功', claimed.task_id, 'claim=', claimed.claim_id)
+  return { ok: true, task: claimed }
+}
+
+// 心跳续约。返回 ok | comm-fail（网络失败）| lost（已被 handleClaimLost 处理）| gone（登录失效）
+async function heartbeatClaim() {
+  if (!claimState) return 'no-claim'
+  let res
+  try {
+    res = await serverApi(`/api/extension/tasks/${encodeURIComponent(claimState.taskId)}/heartbeat`,
+      { method: 'POST', body: { claim_id: claimState.claimId } })
+  } catch (e) {
+    claimState.beatFails = (claimState.beatFails || 0) + 1
+    if (claimState.beatFails >= BEAT_COMM_FAIL_LIMIT) {
+      console.warn('[plugin] 心跳长期不可达，租约必然已过期')
+      await handleClaimLost('心跳长期不可达，租约已过期')
+    }
+    return 'comm-fail'
+  }
+  if (res.status === 401) {   // handleUnauthorized 已清登录态
+    await clearClaimState()
+    return 'gone'
+  }
+  if (res.ok && res.data && res.data.success) {
+    claimState.lastBeatAt = Date.now()
+    claimState.beatFails = 0
+    if (res.data.lease_seconds) claimState.leaseSeconds = res.data.lease_seconds
+    await saveClaimState()
+    return 'ok'
+  }
+  await handleClaimLost((res.data && (res.data.error || res.data.detail)) || `心跳被拒 (${res.status})`)
+  return 'lost'
+}
+
+async function maybeHeartbeat(force = false) {
+  if (!claimState) return
+  if (!force && Date.now() - claimState.lastBeatAt < SERVER_BEAT_INTERVAL_MS) return
+  await heartbeatClaim()
+}
+
+// claim 失效：停止该任务全部本地下载（另一设备可能接管同一任务，避免双份落盘），
+// 并与服务器重新同步该任务的归属状态
+async function handleClaimLost(reason) {
+  if (!claimState) return
+  const taskId = claimState.taskId
+  await clearClaimState()
+  // 先拉一次最新任务列表，保证同步判断准确
+  try {
+    const r = await serverApi('/api/extension/tasks', {})
+    if (r.ok && r.data && Array.isArray(r.data.tasks)) lastServerTasks = r.data.tasks
+  } catch (e) {}
+  const cancelIds = []
+  await withQueue(async () => {
+    const task = await getTask(taskId)
+    if (!task) return
+    for (const tr of task.tracks) {
+      if (tr.status === 'downloading' && tr.downloadId != null) cancelIds.push(tr.downloadId)
+      if (tr.status === 'resolving' || tr.status === 'downloading') {
+        tr.status = 'pending'; tr.error = ''; tr.downloadId = null
+      }
+      inflight.delete(taskId + '/' + tr.track_id)
+    }
+    const serverPending = lastServerTasks.filter(t => t.status === 'pending').map(t => t.task_id)
+    const serverRunning = lastServerTasks.filter(t => t.status === 'running').map(t => t.task_id)
+    if (serverPending.includes(taskId)) {
+      task.status = 'pending'; task.claim_id = null; task.frozen = false
+    } else if (serverRunning.includes(taskId)) {
+      task.status = 'running'; task.claim_id = null; task.frozen = true
+      task.errorMsg = '其他设备正在下载此任务'
+    } else {
+      // 服务器侧已终态（done/cancelled）：本地标记结束，避免残留
+      task.status = 'done'; task.claim_id = null; task.frozen = false
+      if (!task.errorMsg) task.errorMsg = '下载中断（租约失效），任务可能已由服务器侧完成'
+      recomputeProgress(task)
+    }
+    const idx = await getIndex()
+    await setTask(task)
+    upsertIndexEntry(idx, task)
+    await setIndex(idx)
+  })
+  for (const id of cancelIds) { try { await chrome.downloads.cancel(id) } catch (e) {} }
+  console.warn('[plugin] claim 失效，停止本地下载:', taskId, reason)
+}
+
+// 当前 claim 的所有集都已终态 → 上报 complete（释放服务器侧下载槽）
+async function completeClaim() {
+  if (!claimState) return false
+  const task = await getTask(claimState.taskId)
+  if (!task) { await clearClaimState(); return true }
+  recomputeProgress(task)
+  const failedList = task.tracks.filter(t => t.status === 'error')
+    .map(t => ({ episode: t.episode_num, title: t.title, error: t.error || '下载失败' }))
+  let res
+  try {
+    res = await serverApi(`/api/extension/tasks/${encodeURIComponent(claimState.taskId)}/complete`, {
+      method: 'POST',
+      body: {
+        claim_id: claimState.claimId,
+        progress: task.progress,
+        failed_list: failedList,
+        error: failedList.length ? `${failedList.length} 集下载失败` : '',
+      },
+    })
+  } catch (e) {
+    console.warn('[plugin] complete 请求失败，下轮重试', e.message)
+    return false
+  }
+  if (res.ok && res.data && res.data.success) {
+    await updateTask(task.task_id, { status: 'done', claim_id: null, errorMsg: '' })
+    notifyTaskDone(task)
+    await clearClaimState()
+    return true
+  }
+  if (res.status === 409) {
+    await handleClaimLost((res.data && res.data.error) || 'complete 被服务器拒绝')
+    return false
+  }
+  console.warn('[plugin] complete 被拒绝:', res.status, res.data && res.data.error)
+  return false
+}
+
+// 每 tick 一次的 claim 状态机：
+//   有 claim → 心跳 →（完成检测 → complete → 立即 claim 下一本）
+//   无 claim → 按「显式队列 > 自动下载 > 用户显式请求」claim 下一本
+async function tickClaim() {
+  const { token } = await cfg()
+  if (!token) return
+  let guard = 0
+  while (guard++ < 4) {   // 一拍内允许"完成→claim 下一本"链式处理（限次防死循环）
+    if (claimState) {
+      const hb = await heartbeatClaim()
+      if (hb === 'lost' || hb === 'gone') return
+      const task = await getTask(claimState.taskId)
+      if (!task || task.status === 'done' || task.status === 'cancelled') {
+        if (claimState) await clearClaimState()
+        continue
+      }
+      if (task.status === 'running' && !task.paused && task.tracks.length) {
+        const allTerminal = task.tracks.every(t => t.status === 'done' || t.status === 'error')
+        if (allTerminal) {
+          const done = await completeClaim()
+          if (done) continue    // 立即 claim 下一本
+          return                // complete 暂败（网络抖动）→ 下轮再报
+        }
+      }
+      return                    // 当前书仍在下载
+    }
+    // 无活动 claim
+    const s = await getSettings()
+    if (!s.autoDownload && !claimPending && !claimQueue.length) return
+    // 1) 显式队列（用户点过"开始/重试"但当时槽忙）
+    if (claimQueue.length) {
+      while (claimQueue.length) {
+        const cand = claimQueue.shift()
+        const r = await claimTask(cand)
+        if (r.ok) { await pump(); return }
+        if (r.busy) { claimQueue.unshift(cand); return }   // 槽仍忙：下 tick 再试
+        // 其他错误（任务已终态/不存在）：丢弃该项
+      }
+      return
+    }
+    // 2) 服务端 pending 队列（自动下载 / 用户点"全部下载"）
+    const pendingServer = (lastServerTasks || []).filter(t => t.status === 'pending')
+    if (!pendingServer.length) { claimPending = false; return }
+    const idx = await getIndex()
+    const localPending = idx
+      .filter(i => i.status === 'pending' && pendingServer.some(t => t.task_id === i.task_id))
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+    const pickId = localPending.length ? localPending[0].task_id : pendingServer[0].task_id
+    const r = await claimTask(pickId)
+    if (r.ok) { claimPending = false; await pump(); return }
+    if (r.busy) return         // 槽忙：下 tick 重试（claimPending 保持）
+    claimPending = false
+    return
+  }
+}
+
 // ── 事件注册 ──
 chrome.alarms.onAlarm.addListener(handleAlarm)
 chrome.runtime.onMessage.addListener(handleMessage)
 chrome.downloads.onChanged.addListener(handleDownloadChanged)
 
-// 启动：静默下载 UI → 拉取新任务 → 校正历史下载状态（SW 被杀重启场景）→ 自动批准待处理 → 派发续传
+// 启动：静默下载 UI → 恢复 claim 状态 → 拉取任务 → 校正历史下载状态（SW 被杀重启场景）→ claim 状态机 → 派发续传
 applySilentMode()
 pollAnnouncement().catch(() => {})
-pollBackend()
+loadClaimState()
+  .then(() => pollBackend())
   .then(() => reconcileDownloads())
-  .then(() => autoApproveIfEnabled())
+  .then(() => tickClaim())
   .then(() => pump())
   .catch(e => console.error('[plugin] 启动流程 error', e))
 chrome.alarms.create('poll', { periodInMinutes: 1 })
@@ -326,7 +615,7 @@ function handleAlarm(alarm) {
     pollAnnouncement().catch(() => {})
     pollBackend()
       .then(() => reconcileDownloads())
-      .then(() => autoApproveIfEnabled())
+      .then(() => tickClaim())
       .then(() => pump())
       .catch(e => console.error('[plugin] poll error', e))
   }
@@ -334,27 +623,6 @@ function handleAlarm(alarm) {
     // keepAlive 心跳，仅用于保持 SW 存活，无实际业务逻辑
     // console.log('[plugin] keepAlive tick, inflight=', inflight.size)
   }
-}
-
-// 开启「自动下载」时，把所有卡在 pending 的任务批准为 running（含重启前遗留的）
-async function autoApproveIfEnabled() {
-  const s = await getSettings()
-  if (!s.autoDownload) return
-  await withQueue(async () => {
-    const idx = await getIndex()
-    let changed = false
-    for (const item of idx) {
-      if (item.status !== 'pending') continue
-      const task = await getTask(item.task_id)
-      if (task && task.status === 'pending') {
-        task.status = 'running'
-        await setTask(task)
-        upsertIndexEntry(idx, task)
-        changed = true
-      }
-    }
-    if (changed) await setIndex(idx)
-  })
 }
 
 // 统一应答：保证每个消息都有响应（popup 侧 swCall 不会再永久等待）
@@ -412,111 +680,104 @@ async function pollAnnouncement() {
   }
 }
 
-// ── 后端轮询 ──
+// ── 后端轮询：拉取 pending（可 claim）与 running（已被 claim）任务 ──
+// 0.7.0 新流程不再 ack：任务生命周期由 claim/heartbeat/complete/cancel 驱动，
+// pending 任务会持续出现在列表中直到被 claim（本插件幂等去重，重复出现无副作用）。
 async function pollBackend() {
-  const { serverUrl } = await cfg()
-  const headers = await authHeaders()
-  if (!serverUrl || !headers) return
-  let newIds = []   // 真正新建的任务 id
-  let ackIds = []   // 需要 ack 的任务 id（包含新建 + 重复去重后仍需 ack 的）
+  const { serverUrl, token } = await cfg()
+  if (!serverUrl || !token) return
+  let data
   try {
-    const r = await fetch(`${serverUrl}/api/extension/tasks`, { headers })
+    const r = await fetch(`${serverUrl}/api/extension/tasks`, { headers: { Authorization: 'Bearer ' + token } })
     if (r.status === 401) {
       // 被顶下线/解绑/过期/风控：清本地登录态并提示，停止本轮拉取
       await handleUnauthorized((await r.json().catch(() => null))?.detail)
+      lastServerTasks = []
       return
     }
-    const data = await r.json()
+    data = await r.json()
     if (!data.success) { console.warn('[plugin] poll backend failed', data); return }
-    const tasks = data.tasks || []
-    if (!tasks.length) return
-
-    // 本地去重增强：检查是否已存在相同专辑+相同曲目集的任务（任何状态），避免重复推送导致 (1) 副本
-    const existingIdx = await getIndex()
-    const existingTasks = await getTasksBatch(existingIdx.map(i => i.task_id))
-
-    await withQueue(async () => {
-      const idx = await getIndex()
-      let changed = false
-      for (const t of tasks) {
-        if (idx.some(existing => existing.task_id === t.task_id)) {
-          // 已存在相同 task_id，仍需 ack 以防后端重复拉取
-          ackIds.push(t.task_id)
-          continue
-        }
-
-        // 额外去重：同 album_id + 同 track_ids 已存在（running/pending/done）则跳过
-        const newTrackIds = (t.tracks || []).map(x => String(x.track_id)).sort().join(',')
-        const isDup = existingTasks.some(et => {
-          if (et.album_id !== String(t.album_id)) return false
-          if (et.source !== t.source) return false
-          const oldIds = (et.tracks || []).map(x => String(x.track_id)).sort().join(',')
-          return oldIds === newTrackIds && et.status !== 'cancelled'
-        })
-        if (isDup) {
-          console.log('[plugin] 跳过重复推送任务', t.album_id, t.task_id)
-          ackIds.push(t.task_id)
-          continue
-        }
-
-        const tracks = (t.tracks || []).map(tr => ({
-          ...tr, status: 'pending', error: '', downloadId: null,
-        }))
-        const newTask = {
-          ...t, tracks, status: 'pending', paused: false,
-          progress: { total: tracks.length, done: 0, failed: 0 },
-          errorMsg: '', createdAt: Date.now(),
-        }
-        await setTask(newTask)
-        idx.push({
-          task_id: t.task_id,
-          album_id: t.album_id,
-          album_title: t.album_title,
-          source: t.source,
-          status: 'pending',
-          paused: false,
-          createdAt: Date.now(),
-        })
-        newIds.push(t.task_id)
-        ackIds.push(t.task_id)
-        changed = true
-      }
-      if (changed) await setIndex(idx)
-    })
-    // ack（已落库，丢 ack 也只是重复拉取，不会丢任务）
-    for (const tid of ackIds) {
-      try {
-        await fetch(`${serverUrl}/api/extension/tasks/${tid}/ack`, {
-          method: 'POST', headers,
-        })
-      } catch (e) { console.error('[plugin] ack failed', tid, e) }
-    }
-    if (newIds.length) console.log('[plugin] 已拉取新任务', newIds.length, '个')
-    if (ackIds.length !== newIds.length) console.log('[plugin] 已去重/已存在任务', ackIds.length - newIds.length, '个，已 ack')
   } catch (e) { console.error('[plugin] poll error', e); return }
 
-  if (newIds.length) {
-    const s = await getSettings()
-    if (s.autoDownload) {
-      await withQueue(async () => {
-        const idx = await getIndex()
-        let changed = false
-        for (const item of idx) {
-          if (newIds.includes(item.task_id) && item.status === 'pending') {
-            const task = await getTask(item.task_id)
-            if (task && task.status === 'pending') {
-              task.status = 'running'
-              await setTask(task)
-              upsertIndexEntry(idx, task)
-              changed = true
-            }
-          }
-        }
-        if (changed) await setIndex(idx)
+  lastServerTasks = data.tasks || []
+  const claimedId = claimState ? claimState.taskId : null
+
+  await withQueue(async () => {
+    const idx = await getIndex()
+    let changed = false
+
+    // 1) 服务器 → 本地：新任务加入本地队列
+    //    本设备 claim 的任务已在本地（running）；其他设备 claim 的任务以 frozen 展示
+    for (const t of lastServerTasks) {
+      if (idx.some(existing => existing.task_id === t.task_id)) continue
+      const tracks = (t.tracks || []).map(tr => ({
+        ...tr, status: 'pending', error: '', downloadId: null,
+      }))
+      const frozen = t.status === 'running' && t.task_id !== claimedId
+      const newTask = {
+        ...t, tracks,
+        status: frozen ? 'running' : 'pending',
+        paused: false,
+        frozen: frozen,
+        claim_id: null,
+        errorMsg: frozen ? '其他设备正在下载此任务' : '',
+        progress: { total: tracks.length, done: 0, failed: 0 },
+        createdAt: Date.now(),
+      }
+      await setTask(newTask)
+      idx.push({
+        task_id: t.task_id,
+        album_id: t.album_id,
+        album_title: t.album_title,
+        source: t.source,
+        status: newTask.status,
+        paused: false,
+        frozen: frozen,
+        createdAt: Date.now(),
       })
-      pump()
+      changed = true
     }
-  }
+
+    // 2) 服务器状态 → 本地同步（仅处理非本设备 claim 的任务）
+    for (const item of [...idx]) {
+      const st = lastServerTasks.find(t => t.task_id === item.task_id)
+      const task = await getTask(item.task_id)
+      if (!task) continue
+      if (task.task_id === claimedId) continue
+      if (!st) {
+        // 服务器侧已消失（done/cancelled/被删）：本地 pending 的移除；
+        // 本地 done/cancelled 保留展示；frozen 展示任务保留（等待用户处理）
+        if (task.status === 'pending') {
+          await delTask(item.task_id)
+          idx.splice(idx.indexOf(item), 1)
+          changed = true
+        }
+        continue
+      }
+      let taskDirty = false
+      if (st.status === 'running' && task.status === 'pending') {
+        // 其他设备 claim 了它：本地转 frozen 展示，不下载
+        task.status = 'running'; task.frozen = true
+        task.errorMsg = '其他设备正在下载此任务'
+        item.status = 'running'; item.frozen = true
+        taskDirty = true; changed = true
+      } else if (st.status === 'pending' && task.status === 'running' && task.frozen) {
+        // 其他设备释放了：回到本地队列，等待本设备 claim
+        task.status = 'pending'; task.frozen = false; task.errorMsg = ''
+        item.status = 'pending'; item.frozen = false
+        taskDirty = true; changed = true
+      }
+      if (taskDirty) {
+        await setTask(task)
+        upsertIndexEntry(idx, task)
+      }
+    }
+    if (changed) await setIndex(idx)
+  })
+
+  // 随路心跳（节流 30s）
+  if (claimedId) await maybeHeartbeat().catch(e => console.warn('[plugin] poll 心跳异常', e))
+  if (claimedId || lastServerTasks.length) pump()
 }
 
 // ── 启动续传：校正 SW 被杀前的下载状态 ──
@@ -648,34 +909,11 @@ async function reconcileDownloads() {
   maybeStopKeepAlive()
 }
 
-// 手动下载：把 pending 任务标记为 running（已批准），再派发
+// 手动「全部下载」：请求 claim 下一本（全局下载槽：同一时间只有一本在下载），
+// 其余 pending 由 tickClaim 在本本完成后自动接力
 async function approveAndProcess() {
-  await withQueue(async () => {
-    const idx = await getIndex()
-    let changed = false
-    for (const item of idx) {
-      if (item.status === 'pending') {
-        const task = await getTask(item.task_id)
-        if (task && task.status === 'pending') {
-          task.status = 'running'
-          task.paused = false
-          await setTask(task)
-          upsertIndexEntry(idx, task)
-          changed = true
-        }
-      } else if (item.status === 'running' && item.paused) {
-        // 之前暂停的也一并恢复
-        const task = await getTask(item.task_id)
-        if (task) {
-          task.paused = false
-          await setTask(task)
-          upsertIndexEntry(idx, task)
-          changed = true
-        }
-      }
-    }
-    if (changed) await setIndex(idx)
-  })
+  claimPending = true
+  await tickClaim()
   await pump()
 }
 
@@ -684,33 +922,14 @@ const inflight = new Set()          // `${taskId}/${trackId}`，防重复派发�
 let pumping = false
 let pumpQueued = false
 
-// ── 书籍级串行选取 ──
+// ── 书籍级选取：全局下载槽 ⇒ 只有本设备 claim 到的任务（claimState）允许下载 ──
 async function pickBookDispatch() {
-  const idx = await getIndex()
-  const runningIds = idx.filter(i => i.status === 'running').map(i => i.task_id)
-  if (!runningIds.length) return null
-  
-  const tasks = await getTasksBatch(runningIds)
-  
-  let active = null
-  for (const t of tasks) {
-    if (t.paused) continue
-    const busy = t.tracks.some(tr =>
-      tr.status === 'resolving' || tr.status === 'downloading' ||
-      (tr.status === 'pending' && inflight.has(t.task_id + '/' + tr.track_id))
-    )
-    if (busy) { active = t; break }
-  }
-  if (!active) {
-    for (const t of tasks) {
-      if (t.paused) continue
-      if (t.tracks.some(tr => tr.status === 'pending')) { active = t; break }
-    }
-  }
-  if (!active) return null
-  for (const tr of active.tracks) {
-    if (tr.status === 'pending' && !inflight.has(active.task_id + '/' + tr.track_id)) {
-      return { taskId: active.task_id, trackId: tr.track_id }
+  if (!claimState) return null
+  const task = await getTask(claimState.taskId)
+  if (!task || task.status !== 'running' || task.paused) return null
+  for (const tr of task.tracks) {
+    if (tr.status === 'pending' && !inflight.has(claimState.taskId + '/' + tr.track_id)) {
+      return { taskId: claimState.taskId, trackId: tr.track_id }
     }
   }
   return null
@@ -751,6 +970,8 @@ async function pump() {
     }
   }
   if (dispatched) startKeepAlive()
+  // 随路心跳（节流 30s）：下载越活跃，租约越安全
+  if (claimState) maybeHeartbeat().catch(() => {})
 }
 
 // 派发前闸口：读取最新任务状态（暂停/取消对未开始的集立即生效）
@@ -858,6 +1079,12 @@ async function runTrack(taskId, trackId) {
       await updateTrack(taskId, trackId, { status: 'downloading', downloadId, error: '' })
       break
     } catch (e) {
+      if (e instanceof ClaimLostError) {
+        // 服务端判定 claim 失效（cookie/冷却接口被拒）：停止整个任务，不再逐集重试
+        console.warn('[plugin] claim 失效，停止任务', taskId, e.message)
+        await handleClaimLost(e.message)
+        return
+      }
       lastErr = e
       console.warn(`[plugin] 第${attempt}次解析/创建下载失败`, trackId, e && e.message)
       if (attempt < maxRetry) { await sleep(attempt * 1500); continue }
@@ -886,9 +1113,9 @@ async function runTrack(taskId, trackId) {
 async function resolveForTrack(task, tr, ctx) {
   if (task.source === 'official') {
     const sign = await getSign()
-    const accounts = await getXmCookie()
+    const accounts = await getXmCookie(task)   // 携带 task_id/claim_id；校验失败抛 ClaimLostError
     if (!accounts || !accounts.length) throw new Error('无可用官方账号（请先在网页「账号」页登录喜马拉雅账号）')
-    return await resolveOfficialRotation(tr.track_id, task.quality, sign, accounts, ctx)
+    return await resolveOfficialRotation(tr.track_id, task.quality, sign, accounts, task, ctx)
   }
   const resolver = globalThis.RESOLVERS[task.source]
   if (!resolver) throw new Error(`未实现解析器: ${task.source}（本地下载要求 extension/sources/ 下有同名脚本注册该音源。若后端新增了脚本接口，需在 sources/ 放对应 JS 脚本、并在 sources.config.js 的 PLUGIN_SOURCES 登记；否则请改用网页端「服务器端下载」）`)
@@ -978,9 +1205,9 @@ async function pauseTask(taskId) {
 async function resumeTask(taskId) {
   await withQueue(async () => {
     const task = await getTask(taskId)
-    if (task) {
+    if (task && !task.frozen) {
       task.paused = false
-      if (task.status === 'pending') task.status = 'running'
+      // 注意：pending 不置 running —— 下载由 claim 驱动（tickClaim）
       const idx = await getIndex()
       await setTask(task)
       upsertIndexEntry(idx, task)
@@ -995,10 +1222,30 @@ async function resumeTask(taskId) {
       }
     }
   }
+  if (task && task.status === 'pending') { claimPending = true; await tickClaim() }
   await pump()
 }
 
 async function cancelTask(taskId) {
+  // 先通知服务端（新流程）：
+  // - 本设备 claim 中的任务 → 带 claim_id 取消并释放下载槽；
+  // - 尚未 claim 的 pending 任务 → 不带 claim_id 取消（否则之后会被 tickClaim 再次 claim 下载）；
+  // - 其他设备 claim 中的任务（frozen 展示）→ 不动服务端（本地仅取消展示）
+  if (claimState && claimState.taskId === taskId) {
+    try {
+      await serverApi(`/api/extension/tasks/${encodeURIComponent(taskId)}/cancel`,
+        { method: 'POST', body: { claim_id: claimState.claimId } })
+    } catch (e) { console.warn('[plugin] 服务端取消失败', e) }
+    await clearClaimState()
+  } else {
+    const t0 = await getTask(taskId)
+    if (t0 && t0.status === 'pending') {
+      try {
+        await serverApi(`/api/extension/tasks/${encodeURIComponent(taskId)}/cancel`,
+          { method: 'POST', body: {} })
+      } catch (e) { /* 服务器不可达时仅本地取消 */ }
+    }
+  }
   const ids = []
   await withQueue(async () => {
     const task = await getTask(taskId)
@@ -1012,6 +1259,7 @@ async function cancelTask(taskId) {
     }
     task.status = 'cancelled'
     task.paused = false
+    task.claim_id = null
     recomputeProgress(task)
     const idx = await getIndex()
     await setTask(task)
@@ -1023,47 +1271,51 @@ async function cancelTask(taskId) {
 }
 
 async function retryFailed(taskId) {
+  const task = await getTask(taskId)
+  if (!task || task.status === 'cancelled') return
+  if (task.frozen) throw new Error('此任务正由其他设备下载，请在该设备上重试')
+  let has = false
+  for (const tr of task.tracks) {
+    if (tr.status === 'error') { tr.status = 'pending'; tr.error = ''; tr.downloadId = null; has = true }
+  }
+  if (!has) return
   await withQueue(async () => {
-    const task = await getTask(taskId)
-    if (!task) return
-    if (task.status === 'cancelled') return
-    let has = false
-    for (const tr of task.tracks) {
-      if (tr.status === 'error') { tr.status = 'pending'; tr.error = ''; tr.downloadId = null; has = true }
-    }
-    if (has) { task.status = 'running'; task.paused = false }
-    recomputeProgress(task)
     const idx = await getIndex()
     await setTask(task)
     upsertIndexEntry(idx, task)
     await setIndex(idx)
   })
+  // 本设备 claim 仍有效：直接续传失败集
+  if (task.status === 'running' && claimState && claimState.taskId === taskId) {
+    await pump()
+    return
+  }
+  // done（有失败集）或 pending：需要（重新）claim 下载槽
+  if (claimState) {
+    // 当前另一本书在下载：排队，本本完成后自动接力
+    claimQueue.push(taskId)
+    return
+  }
+  const r = await claimTask(taskId)
+  if (r.busy) throw new Error('当前卡密已有下载任务进行中，请等待完成后再开始下一本')
+  if (r.error) throw new Error(r.error)
   await pump()
 }
 
 async function retryAllFailed() {
-  await withQueue(async () => {
-    const idx = await getIndex()
-    let anyChanged = false
-    for (const item of idx) {
-      if (item.status === 'cancelled') continue
-      const task = await getTask(item.task_id)
-      if (!task) continue
-      let has = false
-      for (const tr of task.tracks) {
-        if (tr.status === 'error') { tr.status = 'pending'; tr.error = ''; tr.downloadId = null; has = true }
-      }
-      if (has) {
-        task.status = 'running'; task.paused = false
-        recomputeProgress(task)
-        await setTask(task)
-        upsertIndexEntry(idx, task)
-        anyChanged = true
-      }
-    }
-    if (anyChanged) await setIndex(idx)
-  })
-  await pump()
+  const idx = await getIndex()
+  const candidates = []
+  for (const item of idx) {
+    if (item.status === 'cancelled' || item.frozen) continue
+    const task = await getTask(item.task_id)
+    if (!task) continue
+    if (task.tracks.some(tr => tr.status === 'error')) candidates.push(item.task_id)
+  }
+  if (!candidates.length) return
+  // 全局下载槽：同一时间只能重试一本；第一本立即（或排队）处理，
+  // 其余加入 claimQueue，由 tickClaim 在完成后自动接力
+  await retryFailed(candidates[0])
+  for (let i = 1; i < candidates.length; i++) claimQueue.push(candidates[i])
 }
 
 async function pauseAll() {
@@ -1073,29 +1325,49 @@ async function pauseAll() {
 }
 
 async function startTask(taskId) {
-  await withQueue(async () => {
-    const task = await getTask(taskId)
-    if (task && (task.status === 'pending' || task.status === 'running')) {
-      task.status = 'running'; task.paused = false
+  const task = await getTask(taskId)
+  if (!task) return { ok: false, error: '任务不存在' }
+  if (task.status === 'cancelled') return { ok: false, error: '任务已取消' }
+  if (task.status === 'done') {
+    // 已完成但有失败集 → 走重试（重新 claim）
+    if (task.tracks.some(t => t.status === 'error')) return await retryFailed(taskId)
+    return { ok: false, error: '任务已完成' }
+  }
+  if (task.frozen) return { ok: false, error: '此任务正由其他设备下载' }
+  if (task.status === 'running' && claimState && claimState.taskId === taskId) {
+    // 本设备 claim 中但被暂停 → 恢复
+    await withQueue(async () => {
+      task.paused = false
       const idx = await getIndex()
       await setTask(task)
       upsertIndexEntry(idx, task)
       await setIndex(idx)
-    }
-  })
-  await pump()
+    })
+    await pump()
+    return { ok: true }
+  }
+  // pending（或本地 running 但 claim 已失效）→ (重新) claim 下载槽
+  if (claimState && claimState.taskId !== taskId) {
+    claimQueue.push(taskId)
+    return { ok: true, queued: true, message: '当前卡密已有下载任务进行中，此本将在其完成后自动开始' }
+  }
+  const r = await claimTask(taskId)
+  if (r.ok) { await pump(); return { ok: true } }
+  if (r.busy) return { ok: false, error: '当前卡密已有下载任务进行中，请等待完成后再开始下一本' }
+  return { ok: false, error: r.error }
 }
 
 async function resumeAll() {
+  // 0.7.0：pending 任务不再直接置 running（下载由 claim 驱动），
+  // 只做两件事：恢复本设备 claim 任务/其他 running 任务的暂停；并请求 claim 下一本。
   await withQueue(async () => {
     const idx = await getIndex()
     let changed = false
     for (const item of idx) {
       if (item.status === 'done' || item.status === 'cancelled') continue
-      if (item.status === 'pending' || item.paused) {
+      if (item.status === 'running' && item.paused) {
         const task = await getTask(item.task_id)
-        if (task) {
-          task.status = 'running'
+        if (task && !task.frozen) {
           task.paused = false
           await setTask(task)
           upsertIndexEntry(idx, task)
@@ -1106,7 +1378,7 @@ async function resumeAll() {
     if (changed) await setIndex(idx)
   })
   const idx = await getIndex()
-  const runningIds = idx.filter(i => i.status === 'running').map(i => i.task_id)
+  const runningIds = idx.filter(i => i.status === 'running' && !i.frozen).map(i => i.task_id)
   const tasks = await getTasksBatch(runningIds)
   for (const task of tasks) {
     if (task.status !== 'running') continue
@@ -1116,6 +1388,9 @@ async function resumeAll() {
       }
     }
   }
+  // 有 pending 未开始 → 请求 claim（全局下载槽串行接力）
+  if (idx.some(i => i.status === 'pending')) claimPending = true
+  await tickClaim()
   await pump()
 }
 
@@ -1150,8 +1425,9 @@ function stopKeepAlive() {
 }
 async function maybeStopKeepAlive() {
   if (inflight.size > 0) return
+  if (claimState) return   // claim 进行中：保持 SW 存活（心跳/租约依赖它）
   const idx = await getIndex()
-  const anyActive = idx.some(item => item.status === 'running' && !item.paused)
+  const anyActive = idx.some(item => item.status === 'running' && !item.paused && !item.frozen)
   if (!anyActive) stopKeepAlive()
 }
 
@@ -1244,26 +1520,46 @@ async function getSign() {
   }
 }
 
-// ── 官方账号 cookie：从后端下发（仅当前登录卡密下的可用账号列表），缓存 5 分钟 ──
-let xmCookieCache = null
-let xmCookieTs = 0
-async function getXmCookie() {
+// ── 官方账号 cookie：从后端下发（仅当前登录卡密下的可用账号列表）──
+// 0.7.0：必须携带当前任务的 task_id + claim_id，服务端 5 项校验（本地槽持有/task 匹配/
+// claim 匹配/running/source=official）。缓存按 claim 维度（key=task_id:claim_id）5 分钟，
+// 避免"上一个 claim 的缓存"被用于新任务导致校验失败或串号。
+let xmCookieCache = null   // {key, ts, accounts}
+function xmCookieKey(task) {
+  return ((task && task.task_id) || '') + ':' + ((task && task.claim_id) || '')
+}
+async function getXmCookie(task) {
   const now = Date.now()
-  if (xmCookieCache !== null && now - xmCookieTs < 5 * 60 * 1000) return xmCookieCache
-  const { serverUrl } = await cfg()
-  const headers = await authHeaders()
-  if (!serverUrl || !headers) { xmCookieCache = []; xmCookieTs = now; return [] }
-  try {
-    const r = await fetch(`${serverUrl}/api/extension/xm-cookie`, { headers })
-    if (r.status === 401) { await handleUnauthorized((await r.json().catch(() => null))?.detail); xmCookieCache = []; xmCookieTs = now; return [] }
-    const data = await r.json()
-    xmCookieCache = Array.isArray(data.accounts) ? data.accounts : []
-  } catch (e) {
-    console.warn('[plugin] getXmCookie failed', e)
-    xmCookieCache = []
+  const key = xmCookieKey(task)
+  if (xmCookieCache && xmCookieCache.key === key && now - xmCookieCache.ts < 5 * 60 * 1000) {
+    return xmCookieCache.accounts
   }
-  xmCookieTs = now
-  return xmCookieCache
+  if (!task || !task.task_id) {
+    xmCookieCache = { key, ts: now, accounts: [] }
+    return []
+  }
+  let res
+  try {
+    res = await serverApi('/api/extension/xm-cookie', {
+      params: { task_id: task.task_id, claim_id: task.claim_id || '' },
+    })
+  } catch (e) {
+    console.warn('[plugin] getXmCookie 网络失败', e)
+    xmCookieCache = { key, ts: now, accounts: [] }
+    return []
+  }
+  if (res.status === 401) {
+    xmCookieCache = { key, ts: now, accounts: [] }   // handleUnauthorized 已在 serverApi 内处理
+    return []
+  }
+  if (!res.ok) {
+    // 400/403/409：服务端 claim 校验失败（租约失效/被其他设备持有/任务非官方源）
+    throw new ClaimLostError((res.data && (res.data.error || res.data.detail))
+      || `官方 cookie 被服务器拒绝 (${res.status})`)
+  }
+  const accounts = res.data && Array.isArray(res.data.accounts) ? res.data.accounts : []
+  xmCookieCache = { key, ts: now, accounts }
+  return accounts
 }
 
 function isRateLimited(msg) {
@@ -1271,19 +1567,26 @@ function isRateLimited(msg) {
   return ['网络繁忙', '明天再试', '访问过于频繁', '请求过于频繁'].some(kw => msg.includes(kw))
 }
 
-async function markAccountCooldown(accountId, ctx) {
-  if (!ctx || !ctx.serverUrl || !ctx.token || !accountId) return
+// 冷却接口同样带 claim 凭证校验：防止同卡另一插件在持有者下载期间把所有账号打 24h 冷却（软 DDoS）
+async function markAccountCooldown(accountId, task) {
+  if (!accountId || !task || !task.task_id) return false
+  let res
   try {
-    const cdHeaders = { 'Content-Type': 'application/json', Authorization: 'Bearer ' + ctx.token }
-    await fetch(`${ctx.serverUrl}/api/extension/xm-cookie/cooldown`, {
+    res = await serverApi('/api/extension/xm-cookie/cooldown', {
       method: 'POST',
-      headers: cdHeaders,
-      body: JSON.stringify({ account_id: accountId }),
+      body: { account_id: accountId, task_id: task.task_id, claim_id: task.claim_id || '' },
     })
-    // 冷却后立即失效本地缓存，下次 getXmCookie 会重新拉取可用账号
-    xmCookieCache = null
-    xmCookieTs = 0
-  } catch (e) { console.warn('[plugin] markAccountCooldown failed', e) }
+  } catch (e) { console.warn('[plugin] markAccountCooldown failed', e); return false }
+  if (res.status === 401) return false
+  if (!res.ok) {
+    if (res.status === 403 || res.status === 409 || res.status === 400) {
+      throw new ClaimLostError((res.data && res.data.error) || '冷却请求被服务器拒绝')
+    }
+    console.warn('[plugin] 冷却被拒绝', res.status)
+    return false
+  }
+  xmCookieCache = null   // 冷却后立即失效本地缓存，下次 getXmCookie 重新拉取可用账号
+  return true
 }
 
 let lastInstalledCookie = null
@@ -1318,7 +1621,7 @@ async function installXmCookies(cookieStr) {
   lastInstalledCookie = cookieStr
 }
 
-async function resolveOfficialRotation(trackId, quality, sign, accounts, ctx) {
+async function resolveOfficialRotation(trackId, quality, sign, accounts, task, ctx) {
   // 用 cookie 锁串行化官方解析，防止并发下载时 cookie 串号
   // 每个 track 的 cookie 安装 + fetch 原子化，避免 A 安装了账号1，B 紧接着安装账号2，A 的请求却用了账号2
   return withCookieLock(async () => {
@@ -1337,11 +1640,12 @@ async function resolveOfficialRotation(trackId, quality, sign, accounts, ctx) {
       try {
         return await globalThis.RESOLVERS.official(trackId, quality, sign)
       } catch (e) {
+        if (e instanceof ClaimLostError) throw e   // claim 失效：不再轮询账号，直接向上停止整个任务
         const msg = (e && e.message) ? e.message : String(e)
         errors.push(`账号${acc.id}: ${msg}`)
         if (isRateLimited(msg)) {
           console.warn('[plugin] 官方账号限流，切换下一个:', acc.id, msg)
-          await markAccountCooldown(acc.id, ctx)
+          await markAccountCooldown(acc.id, task)   // 可能抛 ClaimLostError → 向上停止整个任务
         }
       }
     }

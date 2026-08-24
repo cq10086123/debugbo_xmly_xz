@@ -9,6 +9,7 @@
 - api_config       接口与密钥配置表（替代 config.json）
 - download_tasks   下载任务表（替代 batch_tasks.json / thirdparty_tasks.json）
 - download_records 下载记录表（每集一条）
+- card_download_locks 全局下载锁表（同一卡密仅一个下载槽，core/download_slot.py 独占维护）
 - ximalaya_accounts 喜马拉雅账号表（替代 accounts.json）
 - backend_xm_accounts 后端喜马拉雅供体账号池（仅注入逻辑读取，与下载链路隔离）
 - card_logs        卡密操作日志（可选）
@@ -302,8 +303,44 @@ class LocalTask(Base):
     quality = mapped_column(Integer, default=0, nullable=False)
     fmt = mapped_column(String(8), default="mp3", nullable=False)
     tracks = mapped_column(Text, default="[]", nullable=False)   # JSON
-    status = mapped_column(String(16), default="pending", nullable=False)  # pending|done
+    # pending=待 claim | running=已被插件 claim 并下载中 | done=完成 | cancelled=取消
+    status = mapped_column(String(16), default="pending", nullable=False)
+    # ── 下载槽租约字段（core/download_slot.py 维护，全部可空保证存量行兼容）──
+    claim_id = mapped_column(String(32), nullable=True)          # 本次 claim 的凭证（插件心跳/完成/取消须携带）
+    progress = mapped_column(Text, nullable=True)                # JSON {total, done, failed}
+    failed_list = mapped_column(Text, nullable=True)             # JSON [{episode, title, error}, ...]
+    error = mapped_column(Text, nullable=True)
+    claimed_at = mapped_column(DateTime, nullable=True)
+    heartbeat_at = mapped_column(DateTime, nullable=True)
+    lease_until = mapped_column(DateTime, nullable=True, index=True)
+    finished_at = mapped_column(DateTime, nullable=True)
     created_at = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+
+class CardDownloadLock(Base):
+    """全局下载锁 — 同一 card_id 全局唯一（唯一约束兜底，core/download_slot.py 独占维护）
+
+    本地插件任务（holder_type='local'）与服务器任务（'server'）共用此槽：
+    卡密已有任一进行中下载时，另一条下载链路再创建即 409。
+    租约模型：lease_until 到期未续约即视为释放（可被抢占）；release 带所有权校验。
+    """
+
+    __tablename__ = "card_download_locks"
+
+    id = mapped_column(Integer, primary_key=True)
+    card_id = mapped_column(
+        Integer, ForeignKey("cards.id", ondelete="CASCADE"),
+        nullable=False, unique=True, index=True,
+    )
+    holder_type = mapped_column(String(16), nullable=False)  # local | server
+    task_id = mapped_column(String(16), nullable=False, index=True)  # local_tasks.task_id 或服务器 task_id
+    claim_id = mapped_column(String(32), nullable=True)      # local 持有时的 claim 凭证
+    source = mapped_column(String(32), nullable=True)        # official | 第三方接口 name
+    album_id = mapped_column(Text, nullable=True)
+    album_title = mapped_column(Text, nullable=True)
+    acquired_at = mapped_column(DateTime, default=_utcnow, nullable=False)
+    heartbeat_at = mapped_column(DateTime, default=_utcnow, nullable=False)
+    lease_until = mapped_column(DateTime, nullable=False, index=True)
 
 
 class Announcement(Base):
