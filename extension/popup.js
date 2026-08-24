@@ -45,6 +45,7 @@ function fmtBytes(n) {
 }
 
 // 统一的后台通信层：15s 超时 + 捕获异常 + service worker 唤醒竞态导致的 undefined 返回 → 自动重试一次
+// 业务错误（ok:false + error）直接抛出原文，不要伪装成「后台无响应」
 async function swCall(type, body) {
   let lastErr = null
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -54,9 +55,14 @@ async function swCall(type, body) {
         new Promise((_, rej) => setTimeout(() => rej(new Error('后台响应超时')), 15000)),
       ])
       if (r === undefined) throw new Error('no-response')
-      if (r && r.ok === false && r.error) throw new Error(r.error)
+      if (r && r.ok === false && r.error) {
+        const err = new Error(r.error)
+        err.business = true
+        throw err
+      }
       return r
     } catch (e) {
+      if (e && e.business) throw e
       lastErr = e
       await new Promise(res => setTimeout(res, 400))
     }
