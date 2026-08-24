@@ -26,6 +26,14 @@
  *   9) keepAlive 0.5 分钟被 Chrome 钳制到 1 分钟，且不可靠 → 改为 1 分钟，并增加心跳日志
  *  10) buildFilename 未限制长度，可能超 OS 限制 → 增加截断
  *  11) pump 的 activeCount 与 inflight 可能不一致 → 统一使用 inflight.size
+ *
+ * 接力修复（2026-08-24）：
+ *  12) 最后一集 finalizeTask 会先把任务标 done；tickClaim 见 done 只清本地 claim、
+ *      不调 complete → 服务器槽不释放 → 下一本 409「卡密已有下载任务进行中」，
+ *      全局/单本「开始下载」全部卡死。改为：本地 done/全终态必须先 complete 再接力。
+ *  13) 书完成后没有立即 tickClaim（只靠 1 分钟 alarm）→ 完成后立刻 scheduleClaimNext。
+ *  14) 「全部下载」成功 claim 第一本就把 claimPending 清掉，autoDownload=false 时
+ *      第二本不会接力。改为队列空才清。
  */
 importScripts('crypto.js', 'resolvers.js', 'sources.config.js')
 
@@ -303,7 +311,10 @@ async function updateTrack(taskId, trackId, patch) {
     upsertIndexEntry(idx, task)
     await setIndex(idx)
   })
-  if (finished) notifyTaskDone(finished)
+  if (finished) {
+    notifyTaskDone(finished)
+    scheduleClaimNext()
+  }
   maybeStopKeepAlive()
 }
 
@@ -373,7 +384,12 @@ async function claimTask(taskId) {
   } catch (e) {
     return { error: '无法连接服务器: ' + e.message }
   }
-  if (res.status === 409) return { busy: true, holder: res.data && res.data.holder }
+  if (res.status === 409) {
+    const err = (res.data && (res.data.error || res.data.detail)) || ''
+    // 槽被其他任务占用 vs 本任务已不可 claim（running/done）——后者不能当「槽忙」重试
+    if (/不可 claim|任务当前状态|任务不存在/.test(err)) return { error: err || '任务不可 claim' }
+    return { busy: true, holder: res.data && res.data.holder }
+  }
   if (!res.ok || !res.data || !res.data.success) {
     return { error: (res.data && (res.data.error || res.data.detail)) || `claim 失败 (${res.status})` }
   }
@@ -481,7 +497,11 @@ async function handleClaimLost(reason) {
     }
     const serverPending = lastServerTasks.filter(t => t.status === 'pending').map(t => t.task_id)
     const serverRunning = lastServerTasks.filter(t => t.status === 'running').map(t => t.task_id)
-    if (serverPending.includes(taskId)) {
+    if (task.status === 'done' || task.status === 'cancelled') {
+      // 本地已终态：绝不能打回 pending（否则已下完的书会再下一遍）
+      task.claim_id = null
+      task.frozen = false
+    } else if (serverPending.includes(taskId)) {
       task.status = 'pending'; task.claim_id = null; task.frozen = false
     } else if (serverRunning.includes(taskId)) {
       task.status = 'running'; task.claim_id = null; task.frozen = true
@@ -525,12 +545,28 @@ async function completeClaim() {
     return false
   }
   if (res.ok && res.data && res.data.success) {
-    await updateTask(task.task_id, { status: 'done', claim_id: null, errorMsg: '' })
-    notifyTaskDone(task)
+    // 本地可能已被 finalizeTask 标成 done：只清 claim_id，避免重复弹完成通知
+    if (task.status !== 'done') {
+      await updateTask(task.task_id, { status: 'done', claim_id: null, errorMsg: '' })
+      notifyTaskDone(task)
+    } else {
+      await updateTask(task.task_id, { claim_id: null, errorMsg: '' })
+    }
     await clearClaimState()
+    await refreshServerTasks()
     return true
   }
   if (res.status === 409) {
+    // 本地已经全部终态：服务器可能已 complete / 被清扫回 pending，槽实际已空。
+    // 不能走 handleClaimLost（会把已完成的书打回 pending 再下一遍）。
+    const allTerminal = (task.tracks || []).length > 0
+      && task.tracks.every(t => t.status === 'done' || t.status === 'error')
+    if (task.status === 'done' || allTerminal) {
+      console.warn('[plugin] complete 409 但本地已终态，视为已释放', task.task_id, res.data && res.data.error)
+      await clearClaimState()
+      await refreshServerTasks()
+      return true
+    }
     await handleClaimLost((res.data && res.data.error) || 'complete 被服务器拒绝')
     return false
   }
@@ -538,10 +574,42 @@ async function completeClaim() {
   return false
 }
 
+async function refreshServerTasks() {
+  try {
+    const r = await serverApi('/api/extension/tasks', {})
+    if (r.ok && r.data && Array.isArray(r.data.tasks)) lastServerTasks = r.data.tasks
+  } catch (e) {}
+}
+
+// 书完成后立刻接力下一本（不能在 withQueue 锁内调用）
+let tickingClaim = false
+let tickClaimQueued = false
+function scheduleClaimNext() {
+  setTimeout(() => {
+    tickClaim().then(() => pump()).catch(e => console.error('[plugin] 接力 claim 失败', e))
+  }, 0)
+}
+
 // 每 tick 一次的 claim 状态机：
-//   有 claim → 心跳 →（完成检测 → complete → 立即 claim 下一本）
+//   有 claim → 心跳 →（完成检测 → complete 释放槽 → 立即 claim 下一本）
 //   无 claim → 按「显式队列 > 自动下载 > 用户显式请求」claim 下一本
+// 关键：finalizeTask 会先把本地 status 标成 done，此时仍必须 complete，
+// 绝不能只清本地 claimState（否则服务器槽不释放，下一本永远 409）。
 async function tickClaim() {
+  if (tickingClaim) { tickClaimQueued = true; return }
+  tickingClaim = true
+  try {
+    await tickClaimInner()
+  } finally {
+    tickingClaim = false
+    if (tickClaimQueued) {
+      tickClaimQueued = false
+      setTimeout(() => tickClaim(), 0)
+    }
+  }
+}
+
+async function tickClaimInner() {
   const { token } = await cfg()
   if (!token) return
   let guard = 0
@@ -549,20 +617,49 @@ async function tickClaim() {
     if (claimState) {
       const hb = await heartbeatClaim()
       if (hb === 'lost' || hb === 'gone') return
+      if (!claimState) continue
       const task = await getTask(claimState.taskId)
-      if (!task || task.status === 'done' || task.status === 'cancelled') {
-        if (claimState) await clearClaimState()
+      if (!task) {
+        await clearClaimState()
         continue
       }
-      if (task.status === 'running' && !task.paused && task.tracks.length) {
-        const allTerminal = task.tracks.every(t => t.status === 'done' || t.status === 'error')
-        if (allTerminal) {
-          const done = await completeClaim()
-          if (done) continue    // 立即 claim 下一本
-          return                // complete 暂败（网络抖动）→ 下轮再报
-        }
+      if (task.status === 'cancelled') {
+        // cancelTask 已向服务器 cancel 并释放槽；这里只清本地残留
+        await clearClaimState()
+        continue
+      }
+      // 本地已标 done，或全部集已终态：必须先 complete 释放服务器槽，再 claim 下一本
+      const allTerminal = (task.tracks || []).length > 0
+        && task.tracks.every(t => t.status === 'done' || t.status === 'error')
+      if (task.status === 'done' || (task.status === 'running' && !task.paused && allTerminal)) {
+        const done = await completeClaim()
+        if (done) continue    // 立即 claim 下一本
+        return                // complete 暂败（网络抖动）→ 下轮再报
       }
       return                    // 当前书仍在下载
+    }
+    // 自愈：旧版本 tickClaim 见本地 done 只清了 claimState、没调 complete，
+    // 任务上还挂着 claim_id，服务器槽仍被占用。补一次 complete 再接力。
+    {
+      const idxHeal = await getIndex()
+      let orphan = null
+      for (const item of idxHeal) {
+        if (item.status !== 'done') continue
+        const t = await getTask(item.task_id)
+        if (t && t.claim_id) { orphan = t; break }
+      }
+      if (orphan) {
+        claimState = {
+          taskId: orphan.task_id,
+          claimId: orphan.claim_id,
+          leaseSeconds: 300,
+          lastBeatAt: 0,
+          beatFails: 0,
+        }
+        const done = await completeClaim()
+        if (done) continue
+        return
+      }
     }
     // 无活动 claim
     const s = await getSettings()
@@ -587,7 +684,8 @@ async function tickClaim() {
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
     const pickId = localPending.length ? localPending[0].task_id : pendingServer[0].task_id
     const r = await claimTask(pickId)
-    if (r.ok) { claimPending = false; await pump(); return }
+    // 成功也不清 claimPending：全部下载要一直接力到队列空（上面 pendingServer 空才清）
+    if (r.ok) { await pump(); return }
     if (r.busy) return         // 槽忙：下 tick 重试（claimPending 保持）
     claimPending = false
     return
@@ -906,6 +1004,7 @@ async function reconcileDownloads() {
   })
 
   for (const t of finishedList) notifyTaskDone(t)
+  if (finishedList.length) scheduleClaimNext()
   maybeStopKeepAlive()
 }
 
@@ -1134,6 +1233,7 @@ function handleDownloadChanged(delta) {
     resolveTerminal(id)
   }
   if (!delta.state && !delta.error && !delta.filename) return
+  let bookJustFinished = false
   withQueue(async () => {
     const idx = await getIndex()
     let found = false
@@ -1172,14 +1272,20 @@ function handleDownloadChanged(delta) {
         if (delta.state && delta.state.current === 'complete') {
           try { chrome.downloads.erase({ id }).catch(() => {}) } catch (e) {}
         }
-        if (finished) notifyTaskDone({ ...task })
+        if (finished) {
+          notifyTaskDone({ ...task })
+          bookJustFinished = true
+        }
       }
       break
     }
     if (!found) {
       // 未匹配到插件任务，可能是用户手动下载，忽略
     }
-  }).then(() => maybeStopKeepAlive()).catch(e => console.error('[plugin] onChanged error', e))
+  }).then(() => {
+    if (bookJustFinished) scheduleClaimNext()
+    maybeStopKeepAlive()
+  }).catch(e => console.error('[plugin] onChanged error', e))
 }
 
 // ── 下载控制：暂停 / 继续 / 取消 / 重试（全部真正生效）──
@@ -1268,6 +1374,8 @@ async function cancelTask(taskId) {
   })
   for (const id of ids) { try { await chrome.downloads.cancel(id) } catch (e) {} }
   maybeStopKeepAlive()
+  // 取消当前书后立刻接力下一本（槽已在上面释放）
+  scheduleClaimNext()
 }
 
 async function retryFailed(taskId) {
@@ -1292,12 +1400,18 @@ async function retryFailed(taskId) {
   }
   // done（有失败集）或 pending：需要（重新）claim 下载槽
   if (claimState) {
-    // 当前另一本书在下载：排队，本本完成后自动接力
-    claimQueue.push(taskId)
-    return
+    // 当前另一本书在下载（或刚完成尚未 complete）：排队，完成后自动接力
+    if (!claimQueue.includes(taskId)) claimQueue.push(taskId)
+    scheduleClaimNext()
+    return { ok: true, queued: true, message: '当前卡密已有下载任务进行中，此本将在其完成后自动开始' }
   }
   const r = await claimTask(taskId)
-  if (r.busy) throw new Error('当前卡密已有下载任务进行中，请等待完成后再开始下一本')
+  if (r.ok) { await pump(); return { ok: true } }
+  if (r.busy) {
+    if (!claimQueue.includes(taskId)) claimQueue.push(taskId)
+    scheduleClaimNext()
+    return { ok: true, queued: true, message: '当前卡密已有下载任务进行中，此本将在其完成后自动开始' }
+  }
   if (r.error) throw new Error(r.error)
   await pump()
 }
@@ -1348,12 +1462,17 @@ async function startTask(taskId) {
   }
   // pending（或本地 running 但 claim 已失效）→ (重新) claim 下载槽
   if (claimState && claimState.taskId !== taskId) {
-    claimQueue.push(taskId)
+    if (!claimQueue.includes(taskId)) claimQueue.push(taskId)
+    scheduleClaimNext()   // 若当前书已本地完成，立刻 complete 再接力
     return { ok: true, queued: true, message: '当前卡密已有下载任务进行中，此本将在其完成后自动开始' }
   }
   const r = await claimTask(taskId)
   if (r.ok) { await pump(); return { ok: true } }
-  if (r.busy) return { ok: false, error: '当前卡密已有下载任务进行中，请等待完成后再开始下一本' }
+  if (r.busy) {
+    if (!claimQueue.includes(taskId)) claimQueue.push(taskId)
+    scheduleClaimNext()
+    return { ok: true, queued: true, message: '当前卡密已有下载任务进行中，此本将在其完成后自动开始' }
+  }
   return { ok: false, error: r.error }
 }
 
