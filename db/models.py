@@ -253,6 +253,8 @@ class BackendXmAccount(Base):
 
     管理员在后台扫码登录的多个喜马拉雅账号暂存于此；注入时把 cookie 复制成
     某卡密名下的 XimalayaAccount 行。本表与下载链路完全隔离，仅被注入逻辑使用。
+    
+    last_verified_at / is_valid：cookie 有效性验证状态（管理员可手动/批量验证）
     """
 
     __tablename__ = "backend_xm_accounts"
@@ -265,6 +267,9 @@ class BackendXmAccount(Base):
     cookie_str = mapped_column(Text, nullable=True)
     added_at = mapped_column(DateTime, default=_utcnow, nullable=False)
     updated_at = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+    # 验证状态：last_verified_at 为最后验证时间，is_valid 为验证结果（None=未验证）
+    last_verified_at = mapped_column(DateTime, nullable=True)
+    is_valid = mapped_column(Boolean, nullable=True)  # True=有效, False=失效, None=未验证
 
 
 class CardLog(Base):

@@ -76,7 +76,11 @@ def list_accounts(card_id: int) -> list[dict]:
 
 def add_account(card_id: int, nickname: str, uid: str, cookie_str: str,
                 mobile: str = "", is_vip: bool = False) -> dict:
-    """为某卡密添加账号（同卡下同 uid 不重复添加，更新 cookie）。"""
+    """为某卡密添加账号（同卡下同 uid 不重复添加，更新 cookie）。
+
+    用户自扫时清除 injected / backend_src_id 标记，确保后续供体池级联刷新
+    不会覆盖用户主动扫码获得的 cookie。
+    """
     acc_id = f"acc_{uid}"
     db = SessionLocal()
     try:
@@ -88,6 +92,11 @@ def add_account(card_id: int, nickname: str, uid: str, cookie_str: str,
             acc.nickname = nickname or acc.nickname
             acc.mobile = mobile or acc.mobile
             acc.is_vip = is_vip
+            # 用户主动扫码 = 该账号由用户自行管理，不再是供体池注入副本
+            # 清除标记，防止后续供体池 cookie 变更时级联覆盖此账号
+            if acc.injected:
+                acc.injected = False
+                acc.backend_src_id = None
             db.commit()
             return {"id": acc.acc_id or acc_id, "updated": True}
 
@@ -246,6 +255,8 @@ def list_backend_accounts() -> list[dict]:
             "is_vip": bool(b.is_vip),
             "added_at": _fmt(b.added_at),
             "updated_at": _fmt(b.updated_at),
+            "last_verified_at": _fmt(b.last_verified_at),
+            "is_valid": b.is_valid,  # True/False/None
         } for b in rows]
     finally:
         db.close()
@@ -268,24 +279,45 @@ def get_backend_account(backend_id: int) -> Optional[dict]:
 
 def add_backend_account(nickname: str, uid: str, cookie_str: str,
                         mobile: str = "", is_vip: bool = False) -> dict:
-    """向供体池新增/更新一个后端账号（同 uid 不重复，更新 cookie）"""
+    """向供体池新增/更新一个后端账号（同 uid 不重复，更新 cookie）
+
+    级联刷新：当已有账号的 cookie 被更新时，自动同步到所有由该供体注入的
+    工作表副本（ximalaya_accounts.injected=True 且 backend_src_id 匹配的行），
+    不影响用户自行扫码登录的账号（injected=False）。
+    """
     db = SessionLocal()
     try:
         b = db.query(BackendXmAccount).filter_by(uid=str(uid)).first()
         if b is not None:
+            old_cookie = b.cookie_str
             b.cookie_str = cookie_str
             b.nickname = nickname or b.nickname
             b.mobile = mobile or b.mobile
             b.is_vip = is_vip
+            b.updated_at = _now()
+            # 级联刷新：cookie 变化时同步到所有已注入的工作表副本
+            cascade_count = 0
+            if old_cookie != cookie_str:
+                cascade_count = db.query(XimalayaAccount).filter_by(
+                    injected=True, backend_src_id=b.id,
+                ).update(
+                    {
+                        XimalayaAccount.cookie_str: cookie_str,
+                        XimalayaAccount.is_vip: is_vip,
+                        XimalayaAccount.nickname: nickname or b.nickname,
+                        XimalayaAccount.mobile: mobile or b.mobile,
+                    },
+                    synchronize_session=False,
+                )
             db.commit()
-            return {"id": b.id, "updated": True}
+            return {"id": b.id, "updated": True, "cascade_count": cascade_count}
         new_b = BackendXmAccount(
             uid=str(uid), nickname=nickname, mobile=mobile,
             cookie_str=cookie_str, is_vip=is_vip, added_at=_now(), updated_at=_now(),
         )
         db.add(new_b)
         db.commit()
-        return {"id": new_b.id, "updated": False}
+        return {"id": new_b.id, "updated": False, "cascade_count": 0}
     finally:
         db.close()
 
@@ -361,4 +393,95 @@ def revoke_injected(card_id: int) -> int:
         return n
     finally:
         db.close()
+
+
+# ========== 供体池验证（验证 cookie 有效性） ==========
+
+def verify_backend_account(backend_id: int) -> dict:
+    """验证单个供体账号的 cookie 有效性。
+
+    返回 {"id": ..., "is_valid": True/False, "nickname": ..., "is_vip": ..., "error": ...}
+    验证结果会持久化到 backend_xm_accounts 表。
+    """
+    from core import login as login_module  # 延迟导入，避免循环依赖
+
+    db = SessionLocal()
+    try:
+        b = db.query(BackendXmAccount).filter_by(id=backend_id).first()
+        if not b:
+            return {"id": backend_id, "is_valid": False, "error": "账号不存在"}
+        cookie_str = b.cookie_str or ""
+        cookies = {}
+        for item in cookie_str.split("; "):
+            if "=" in item:
+                k, v = item.split("=", 1)
+                cookies[k] = v
+        user = login_module.verify_login(cookies)
+        now = _now()
+        if user:
+            b.is_valid = True
+            b.last_verified_at = now
+            # 顺便刷新 VIP 状态和昵称
+            new_is_vip = user.get("isVip", False)
+            new_nickname = user.get("nickname", "") or b.nickname
+            b.is_vip = new_is_vip
+            b.nickname = new_nickname
+            # 级联刷新 VIP 状态和昵称到已注入的工作表副本
+            # （cookie 不变，只同步元数据；cookie 级联由 add_backend_account 负责）
+            db.query(XimalayaAccount).filter_by(
+                injected=True, backend_src_id=b.id,
+            ).update(
+                {
+                    XimalayaAccount.is_vip: new_is_vip,
+                    XimalayaAccount.nickname: new_nickname,
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+            return {
+                "id": b.id, "is_valid": True,
+                "nickname": b.nickname, "is_vip": b.is_vip,
+                "verified_at": _fmt(now),
+            }
+        else:
+            b.is_valid = False
+            b.last_verified_at = now
+            db.commit()
+            return {
+                "id": b.id, "is_valid": False,
+                "verified_at": _fmt(now),
+                "error": "Cookie 已失效",
+            }
+    except Exception as e:
+        return {"id": backend_id, "is_valid": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+def verify_all_backend_accounts() -> dict:
+    """批量验证供体池全部账号，返回验证结果汇总。
+
+    逐个调用 verify_backend_account，避免一个失败影响其余。
+    """
+    db = SessionLocal()
+    try:
+        ids = [b.id for b in db.query(BackendXmAccount).order_by(BackendXmAccount.id).all()]
+    finally:
+        db.close()
+    results = []
+    valid_count = 0
+    invalid_count = 0
+    for bid in ids:
+        r = verify_backend_account(bid)
+        results.append(r)
+        if r.get("is_valid"):
+            valid_count += 1
+        else:
+            invalid_count += 1
+    return {
+        "total": len(ids),
+        "valid": valid_count,
+        "invalid": invalid_count,
+        "details": results,
+    }
 

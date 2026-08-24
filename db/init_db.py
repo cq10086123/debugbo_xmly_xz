@@ -36,6 +36,7 @@ def init_db():
     _migrate_card_columns()
     _migrate_session_columns()
     _migrate_backend_columns()
+    _migrate_backend_xm_columns()
     _migrate_config_json()
     _migrate_accounts_json()
     _ensure_default_admin()
@@ -95,6 +96,25 @@ def _migrate_backend_columns():
             if name not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE ximalaya_accounts ADD COLUMN {name} {ddl}")
                 logger.info(f"ximalaya_accounts 表补充列: {name}")
+        conn.commit()
+
+
+def _migrate_backend_xm_columns():
+    """轻量迁移：为已存在的 backend_xm_accounts 表补充验证相关列。
+
+    - last_verified_at  DATETIME  最后验证时间
+    - is_valid          INTEGER   验证结果（1=有效, 0=失效, NULL=未验证）
+    """
+    needed = {
+        "last_verified_at": "DATETIME",
+        "is_valid": "INTEGER",
+    }
+    with _engine.connect() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(backend_xm_accounts)").fetchall()}
+        for name, ddl in needed.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE backend_xm_accounts ADD COLUMN {name} {ddl}")
+                logger.info(f"backend_xm_accounts 表补充列: {name}")
         conn.commit()
 
 
