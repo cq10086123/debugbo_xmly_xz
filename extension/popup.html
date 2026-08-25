@@ -130,6 +130,11 @@
     <div id="summary"></div>
     <div id="tasks"></div>
   </div>
+  <div id="macTipBox" class="ann-box" style="display:none">
+    <div class="ann-head"><span class="ann-badge">🍎 Mac 专属提示</span><span class="ann-close" id="macTipClose" title="关闭">✕</span></div>
+    <div class="ann-content">Mac 版 Chrome 常默认开启「下载前询问每个文件的保存位置」，会导致<b>每一集</b>都弹出「另存为」窗口等你手动保存。请打开 Chrome 下载设置，关闭该开关后插件即可自动保存每一集（这是浏览器设置，插件无法替你修改）。</div>
+    <div class="btnrow"><button id="macTipOpen" class="alt">打开 Chrome 下载设置</button><button id="macTipAck">知道了</button></div>
+  </div>
   <div class="status" id="msg"></div>
   <script src="config.js"></script>
   <script src="popup.js"></script>

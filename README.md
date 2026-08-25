@@ -225,6 +225,8 @@ registerSource({ name: 'A', displayName: '免密A' }, async (chapter, ctx) => {
 - 脚本经过混淆（`A.js` / `B.js` 已混淆，`registerSource` 注册名仍以原始 `A`/`B` 保留）。
 - 仅「需要插件本地下载」的第三方音源才写 `sources/*.js` + 注册；只走服务器端下载的音源无需动插件。
 
+**排查：用户反馈「每一集都要手动点保存」（常见于 macOS）** —— 不是插件 bug，而是用户 Chrome 开启了设置「下载前询问每个文件的保存位置」（`chrome://settings/downloads`，Mac 版 Chrome 较常默认开启，Windows 默认关闭，所以只有 Mac 用户反馈）。该设置开启时，扩展即使用 `saveAs: false` 调用 `chrome.downloads.download`，Chrome 仍会对每一集弹出「另存为」窗口，且不点保存队列就卡住——这是 Chrome 故意保留的用户控制项，扩展无法用代码绕过。0.7.2 起插件会：Mac 上弹窗展示一次性提示条、后台检测「下载中长时间 0 字节」弹系统通知、超时错误信息附带排查指引；客服只需引导用户关闭该开关即可。
+
 ### 5. 网络绑定（一卡一 IP / 顶号换绑）
 
 防止一张卡密多人共用，同时对家庭用户宽松：卡密绑定**出口网络**而非具体设备。

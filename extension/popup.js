@@ -5,6 +5,31 @@ const $ = (id) => document.getElementById(id)
 const BUILTIN_SERVER = (typeof PLUGIN_CONFIG !== 'undefined' && PLUGIN_CONFIG.serverUrl
   ? String(PLUGIN_CONFIG.serverUrl) : '').trim().replace(/\/+$/, '')
 
+// ── 平台检测 + macOS「另存为」提示 ──
+// macOS 上 Chrome 常默认开启「下载前询问每个文件的保存位置」，每一集都会弹「另存为」窗口
+// 需要手动保存（扩展无法绕过该浏览器设置）。检测到 Mac 就展示一次可关闭的提示条。
+let PLATFORM_OS = ''
+if (chrome.runtime.getPlatformInfo) {
+  try {
+    chrome.runtime.getPlatformInfo((info) => {
+      PLATFORM_OS = (info && info.os) || ''
+      maybeShowMacTip()
+    })
+  } catch (e) {}
+}
+
+async function maybeShowMacTip() {
+  if (PLATFORM_OS !== 'mac') return
+  try {
+    const o = await new Promise(r => chrome.storage.local.get(['xm_mac_tip_read'], r))
+    if (!o.xm_mac_tip_read) $('macTipBox').style.display = 'block'
+  } catch (e) {}
+}
+async function dismissMacTip() {
+  try { await new Promise(r => chrome.storage.local.set({ xm_mac_tip_read: true }, r)) } catch (e) {}
+  $('macTipBox').style.display = 'none'
+}
+
 function setMsg(text, cls) {
   const el = $('msg')
   el.textContent = text || ''
@@ -313,6 +338,20 @@ $('tasks').addEventListener('click', async (e) => {
   } catch (err) { setMsg('操作失败：' + err.message, 'err') }
 })
 
+// ── 「另存为」卡住检测 ──
+// 下载中但长时间 0 字节：大概率是浏览器弹了「另存为」窗口等待手动保存
+// （Chrome 设置「下载前询问每个文件的保存位置」开启时每集都会弹，插件无法绕过）。
+// 并发下载较多时 Chrome 会自行排队（同样 0 字节），此时不算卡住。
+let activeDownloads = 0
+const STALL_HINT_MS = 60 * 1000
+function isStalledBySaveDialog(tr, dlMap) {
+  if (activeDownloads > 3) return false
+  const it = dlMap && dlMap[tr.downloadId]
+  return tr.status === 'downloading' && it && it.state === 'in_progress' && !it.paused
+    && it.bytesReceived === 0 && it.startTime
+    && (Date.now() - Date.parse(it.startTime)) > STALL_HINT_MS
+}
+
 // ── 渲染任务队列（含 Chrome 下载管理器的实时字节进度）──
 async function renderQueue() {
   let r
@@ -321,8 +360,10 @@ async function renderQueue() {
 
   // 实时字节进度（popup 打开期间直查 Chrome 下载管理器，无需后台持久化）
   let dlMap = {}
+  activeDownloads = 0
   try {
     const items = await chrome.downloads.search({ state: 'in_progress' })
+    activeDownloads = items.length
     for (const it of items) dlMap[it.id] = it
   } catch (e) {}
 
@@ -414,10 +455,12 @@ async function renderQueue() {
     }
 
     const resolvingText = resolving ? ` · ${resolving} 解析中` : ''
+    const stalledCount = tracks.filter(tr => isStalledBySaveDialog(tr, dlMap)).length
     div.innerHTML = `
       <div class="task-head"><b>${escapeHtml(t.album_title || ('专辑 ' + t.album_id))}</b><span class="muted"> · ${escapeHtml(t.source)} · ${statusText}</span></div>
       <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
       <div class="muted">${done}/${total} 完成 · ${failed} 失败 · ${downloading} 下载中${resolvingText} · ${pending} 待处理 · ${pct}%</div>
+      ${stalledCount ? `<div class="err">⚠ 有 ${stalledCount} 集长时间停在 0 字节：浏览器很可能弹出了「另存为」窗口等你手动保存。打开 <b>chrome://settings/downloads</b> 关闭「下载前询问每个文件的保存位置」，插件才能自动保存每一集。</div>` : ''}
       ${t.errorMsg ? `<div class="err">${escapeHtml(t.errorMsg)}</div>` : ''}
       <div class="actions">${actions}</div>
       ${tracksHtml}
@@ -438,6 +481,9 @@ function trackRow(tr, dlMap) {
     if (it) {
       const totalTxt = it.totalBytes > 0 ? fmtBytes(it.totalBytes) : '?'
       extra = `<span class="bytes">${it.paused ? '⏸ ' : ''}${fmtBytes(it.bytesReceived)}/${totalTxt}</span>`
+      if (isStalledBySaveDialog(tr, dlMap)) {
+        extra += '<span class="err">💾 可能在等「另存为」手动保存…</span>'
+      }
     }
   }
   return `<div class="tr"><span class="dot ${dotCls}"></span><span class="tt">${escapeHtml(String(tr.episode_num || tr.track_id || ''))}. ${escapeHtml(tr.title || '')}</span>${extra}${err}</div>`
@@ -445,6 +491,16 @@ function trackRow(tr, dlMap) {
 
 $('annAck').onclick = dismissAnnouncement
 $('annClose').onclick = dismissAnnouncement
+
+$('macTipAck').onclick = dismissMacTip
+$('macTipClose').onclick = dismissMacTip
+$('macTipOpen').onclick = () => {
+  try {
+    chrome.tabs.create({ url: 'chrome://settings/downloads' }, () => {})
+  } catch (e) {
+    setMsg('请在 Chrome 地址栏输入 chrome://settings/downloads 并回车，关闭「下载前询问每个文件的保存位置」', 'err')
+  }
+}
 
 // ── 连接状态 ──
 async function startConn() {

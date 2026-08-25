@@ -46,6 +46,18 @@ for (const f of (globalThis.PLUGIN_SOURCES || [])) {
   }
 }
 
+// ── 平台检测 ──
+// macOS 上 Chrome 常默认开启「下载前询问每个文件的保存位置」（chrome://settings/downloads），
+// 该设置开启时，即使扩展用 saveAs:false 调 chrome.downloads.download，每一集仍会弹「另存为」窗口
+// 等用户手动保存 —— 这是 Chrome 故意保留的用户控制项，扩展无法用代码绕过。
+// 因此这里做平台检测，配合下方 maybeNotifyMacSaveDialog 检测「下载中但长时间 0 字节」的典型卡住症状并提示用户。
+let PLATFORM_OS = ''
+try {
+  if (chrome.runtime.getPlatformInfo) {
+    chrome.runtime.getPlatformInfo((info) => { PLATFORM_OS = (info && info.os) || '' })
+  }
+} catch (e) { console.warn('[plugin] 获取平台信息失败', e && e.message) }
+
 // ── 存储 key 定义 ──
 const STORAGE_QUEUE = 'xm_taskQueue'      // 保留旧 key 用于向后兼容/迁移
 const STORAGE_INDEX = 'xm_taskIndex'      // 新：轻量索引
@@ -878,6 +890,32 @@ async function pollBackend() {
   if (claimedId || lastServerTasks.length) pump()
 }
 
+// ── macOS「另存为」卡住检测 ──
+// 症状：Chrome 设置「下载前询问每个文件的保存位置」开启时，每集都会弹「另存为」窗口，
+// 下载项停在 in_progress 且 0 字节，用户不点保存就一直不动（30 分钟后被判定超时）。
+// reconcileDownloads 每分钟随 poll 跑一次，这里检测该症状并弹一次系统通知（按 downloadId 去重）。
+const MAC_STALL_NOTIFY_MS = 90 * 1000
+const macStallNotified = new Set() // downloadId 去重，避免每分钟重复弹通知
+async function maybeNotifyMacSaveDialog(snap, it) {
+  try {
+    if (PLATFORM_OS !== 'mac' || !it || snap.downloadId == null) return
+    if (it.state !== 'in_progress' || it.paused || it.bytesReceived > 0 || !it.startTime) return
+    if (Date.now() - Date.parse(it.startTime) < MAC_STALL_NOTIFY_MS) return
+    if (macStallNotified.has(snap.downloadId)) return
+    // 并发下载较多时 Chrome 会自行排队（同样 0 字节），此时不算卡在另存为
+    const active = await chrome.downloads.search({ state: 'in_progress' })
+    if (active.length > 3) return
+    macStallNotified.add(snap.downloadId)
+    chrome.notifications.create('xm_mac_save_' + snap.downloadId, {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icon128.png'),
+      title: '下载可能卡在「另存为」窗口',
+      message: '有音频长时间停在 0 字节，浏览器大概率弹出了保存对话框等待手动确认。请打开 chrome://settings/downloads 关闭「下载前询问每个文件的保存位置」，插件才能自动保存每一集（这是浏览器设置，插件无法替你修改）。',
+      priority: 2,
+    }).catch(() => {})
+  } catch (e) { console.warn('[plugin] mac 另存为检测异常', e && e.message) }
+}
+
 // ── 启动续传：校正 SW 被杀前的下载状态 ──
 // 修复：之前在 withQueue 锁内串行执行 chrome.downloads.search，导致锁长时间占用，进度卡住
 // 新实现：两阶段，先快照需要检查的 track，再锁外查询，最后锁内批量更新，并重建 inflight
@@ -920,7 +958,9 @@ async function reconcileDownloads() {
     }
     try {
       const items = await chrome.downloads.search({ id: s.downloadId })
-      searchResults.set(s.downloadId, items && items[0] ? items[0] : null)
+      const it = items && items[0] ? items[0] : null
+      searchResults.set(s.downloadId, it)
+      await maybeNotifyMacSaveDialog(s, it)
     } catch (e) {
       searchResults.set(s.downloadId, null)
     }
@@ -1201,7 +1241,11 @@ async function runTrack(taskId, trackId) {
     // 超时后清理 resolver，防止泄漏
     trackDoneResolvers.delete(downloadId)
     pendingTerminals.delete(downloadId)
-    await updateTrack(taskId, trackId, { status: 'error', error: '下载超时（30分钟未完成）' })
+    // macOS 上 90% 的「超时」都是因为每一集弹「另存为」窗口没人点保存：把排查方向直接写进错误信息
+    const timeoutHint = PLATFORM_OS === 'mac'
+      ? '。若浏览器每一集都弹出「另存为」窗口等你手动保存，请打开 chrome://settings/downloads 关闭「下载前询问每个文件的保存位置」后重试'
+      : ''
+    await updateTrack(taskId, trackId, { status: 'error', error: '下载超时（30分钟未完成）' + timeoutHint })
     try { await chrome.downloads.cancel(downloadId) } catch (e) {}
   } else {
     // 正常完成，resolver 已在 resolveTerminal 中删除，此处防御性清理
@@ -1230,6 +1274,7 @@ function handleDownloadChanged(delta) {
     || (delta.error && delta.error.current)
   if (terminal) {
     console.log('[plugin] download terminal', id, delta.state && delta.state.current, delta.error && delta.error.current)
+    macStallNotified.delete(id)
     resolveTerminal(id)
   }
   if (!delta.state && !delta.error && !delta.filename) return
