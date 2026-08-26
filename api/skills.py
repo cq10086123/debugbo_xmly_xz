@@ -72,16 +72,16 @@ async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_curren
         if not resp.get("success"):
             return resp
         
-        docs = resp.get("list", [])
+        docs = resp.get("results", resp.get("list", []))
         simplified = []
         for doc in docs[:10]:
             simplified.append({
                 "source": req.source,
-                "album_id": doc.get("id"),
+                "album_id": doc.get("id", doc.get("albumId")),
                 "title": doc.get("title"),
                 "author": doc.get("author"),
                 "intro": doc.get("intro", "")[:100],
-                "tracks_count": "未知" 
+                "tracks_count": doc.get("trackCount", doc.get("tracks", doc.get("count", "未知")))
             })
         return {"success": True, "results": simplified}
 
@@ -109,12 +109,12 @@ async def skill_get_chapters(req: AlbumIdRequest, auth: dict = Depends(get_curre
             if not result.get("success"):
                 return result
             
-            chapters = result.get("chapters", [])
+            tracks = result.get("tracks", [])
             return {
                 "success": True,
                 "source": req.source,
-                "total_count": len(chapters),
-                "suggestion": f"共找到 {len(chapters)} 集，请询问用户需要下载哪几集（例如：1到10集）"
+                "total_count": len(tracks),
+                "suggestion": f"共找到 {len(tracks)} 集，请询问用户需要下载哪几集（例如：1到10集）"
             }
     except Exception as e:
         return {"success": False, "error": str(e)}
