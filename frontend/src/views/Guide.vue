@@ -1,6 +1,21 @@
 <script setup>
 import { getBizToken } from '../utils/request'
 
+
+function downloadSkills() {
+  const token = getBizToken()
+  if (!token) {
+    alert('请先登录卡密后再下载 Skills 配置')
+    return
+  }
+  const a = document.createElement('a')
+  a.href = `/api/skills/export_openapi?token=${encodeURIComponent(token)}`
+  a.download = `ai_skills_config_${token.substring(0,4)}.json`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+
 function downloadExtension() {
   const token = getBizToken()
   if (!token) {
@@ -97,6 +112,13 @@ function downloadExtension() {
         <p>多账号可按需在「我的账号」中添加并轮换，进一步分散单账号压力。</p>
         <p>遇到任务大面积失败、提示签名错误/429/风控时，先暂停、降低并发，或切换到本地下载。</p>
       </div>
+    </section>
+
+
+    <section class="card-panel pad">
+      <h2>🤖 AI 助手 Skills 配置下载</h2>
+      <p class="muted">如果你想在微信、Coze 或 Dify 等 AI 助手中使用当前卡密通过对话来控制下载，请点击下方下载你的专属 Skills 配置文件。将其导入到 AI 平台中即可使用，里面<b>已自动内置你当前的卡密</b>。</p>
+      <button class="success big" @click="downloadSkills">📥 下载专属 AI Skills 配置</button>
     </section>
 
     <section class="card-panel pad">
