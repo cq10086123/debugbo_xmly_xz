@@ -120,7 +120,7 @@ async def skill_retry_task(req: TaskIdRequest, auth: dict = Depends(get_current_
 
 
 @router.post("/reset_stuck_local_task", summary="重置卡死的本地插件任务", description="当 check_local_tasks 发现有任务长时间卡在 running 状态进度不动，或者是由于浏览器崩溃导致的僵尸任务时，调用此接口将其重置为 pending，让插件能重新接管下载。")
-async def skill_reset_stuck_local_task(req: TaskIdRequest, auth: dict = Depends(get_current_card)):
+def skill_reset_stuck_local_task(req: TaskIdRequest, auth: dict = Depends(get_current_card)):
     from db.session import SessionLocal
     from db.models import LocalTask
     
