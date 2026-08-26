@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import Header, HTTPException, Query, Request
 
 from db.session import SessionLocal
-from db.models import Session as CardSession, AdminToken
+from db.models import Session as CardSession, AdminToken, Card
 from api.card_helpers import is_expired, mark_expired, card_bound_interfaces
 
 logger = logging.getLogger(__name__)
@@ -127,6 +127,43 @@ def ensure_quark_sync_allowed(auth: dict) -> None:
             status_code=403,
             detail="当前卡密未开通夸克同步，请联系管理员在后台开启",
         )
+
+
+async def get_current_card_skill(
+    authorization: str | None = Header(default=None),
+) -> dict:
+    """SKILL 专用鉴权：只认 cards.skill_token，与网页/插件 session 完全隔离。
+
+    跳过：网络绑定（check_session）、同 token 多 IP 风控、会话空闲 TTL、顶号踢线。
+    保留：token 存在、卡密未禁用、卡密未过期；返回的 auth 仍含 bound / download_mode / quark_sync，
+    下游 ensure_interface_allowed / ensure_download_mode_allowed / download_slot 不受影响。
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录或 token 缺失")
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="未登录或 token 缺失")
+
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(skill_token=token).first()
+        if not card:
+            raise HTTPException(status_code=401, detail="SKILL token 无效或已作废，请重新导出配置")
+        if card.status == "disabled":
+            raise HTTPException(status_code=403, detail="卡密已被禁用")
+        if is_expired(card):
+            mark_expired(db, card)
+            raise HTTPException(status_code=401, detail="卡密已过期")
+        return {
+            "card_id": card.id,
+            "code": card.code,
+            "token": token,
+            "bound": card_bound_interfaces(card),
+            "download_mode": getattr(card, "download_mode", None) or "both",
+            "quark_sync": bool(getattr(card, "quark_sync", False)),
+        }
+    finally:
+        db.close()
 
 
 async def get_current_card(

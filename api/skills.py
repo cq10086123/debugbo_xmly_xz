@@ -4,7 +4,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from api.deps import get_current_card, ensure_interface_allowed
+from api.deps import (
+    get_current_card,
+    get_current_card_skill,
+    get_current_card_download,
+    ensure_interface_allowed,
+)
 from api.search import _do_search
 from api.download import (
     start_batch_download, 
@@ -46,12 +51,12 @@ class QuarkJobIdRequest(BaseModel):
 
 
 @router.post("/get_sources", summary="获取所有可用的音源接口", description="返回系统中当前可用的音源接口列表。大模型在搜索书籍前，可以先调用此接口让用户选择使用哪个音源，或者直接列出给用户看。")
-async def skill_get_sources(auth: dict = Depends(get_current_card)):
+async def skill_get_sources(auth: dict = Depends(get_current_card_skill)):
     from api.interfaces import public_interface_list
     return await public_interface_list(auth)
 
 @router.post("/search_books", summary="搜索书籍", description="当用户想听某本书但不知道 album_id 时调用此接口。可以指定 source（默认 official）。返回相关书籍列表与对应的 album_id。")
-async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_current_card)):
+async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_current_card_skill)):
     if req.source == "official":
         ensure_interface_allowed(auth, "official")
         data = await asyncio.to_thread(_do_search, req.keyword, 1)
@@ -93,7 +98,7 @@ async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_curren
 
 
 @router.post("/get_chapters", summary="获取书籍章节概况", description="在用户要下载前，获取此书籍共有多少集。必须传入搜索时获得的 source 和 album_id。")
-async def skill_get_chapters(req: AlbumIdRequest, auth: dict = Depends(get_current_card)):
+async def skill_get_chapters(req: AlbumIdRequest, auth: dict = Depends(get_current_card_skill)):
     try:
         if req.source == "official":
             ensure_interface_allowed(auth, "official")
@@ -127,7 +132,7 @@ async def skill_get_chapters(req: AlbumIdRequest, auth: dict = Depends(get_curre
 
 
 @router.post("/submit_download", summary="提交服务器下载任务", description="当用户确认书籍和章节范围后调用。如果成功会返回 task_id，务必将 task_id 记住以查询进度。")
-async def skill_submit_download(req: DownloadSubmitRequest, auth: dict = Depends(get_current_card)):
+async def skill_submit_download(req: DownloadSubmitRequest, auth: dict = Depends(get_current_card_skill)):
     try:
         if req.source == "official":
             inner_req = BatchDownloadRequest(
@@ -152,7 +157,7 @@ async def skill_submit_download(req: DownloadSubmitRequest, auth: dict = Depends
 
 
 @router.post("/check_task_status", summary="查询下载任务进度", description="使用 submit_download 返回的 task_id 查询实时进度、失败情况。")
-async def skill_check_task_status(req: TaskIdRequest, auth: dict = Depends(get_current_card)):
+async def skill_check_task_status(req: TaskIdRequest, auth: dict = Depends(get_current_card_skill)):
     status_resp = await get_batch_status(req.task_id, auth=auth)
     if not status_resp.get("success"):
         return status_resp
@@ -179,12 +184,12 @@ async def skill_check_task_status(req: TaskIdRequest, auth: dict = Depends(get_c
     return summary
 
 @router.post("/retry_task", summary="重试失败的下载任务", description="当 check_task_status 显示有失败项时，调用此接口触发重试。")
-async def skill_retry_task(req: TaskIdRequest, auth: dict = Depends(get_current_card)):
+async def skill_retry_task(req: TaskIdRequest, auth: dict = Depends(get_current_card_skill)):
     return await retry_batch_failed(req.task_id, auth=auth)
 
 
 @router.post("/reset_stuck_local_task", summary="重置卡死的本地插件任务", description="当 check_local_tasks 发现有任务长时间卡在 running 状态进度不动，或者是由于浏览器崩溃导致的僵尸任务时，调用此接口将其重置为 pending，让插件能重新接管下载。")
-def skill_reset_stuck_local_task(req: TaskIdRequest, auth: dict = Depends(get_current_card)):
+def skill_reset_stuck_local_task(req: TaskIdRequest, auth: dict = Depends(get_current_card_skill)):
     from db.session import SessionLocal
     from db.models import LocalTask
     
@@ -212,7 +217,7 @@ def skill_reset_stuck_local_task(req: TaskIdRequest, auth: dict = Depends(get_cu
         db.close()
 
 @router.post("/get_card_info", summary="获取卡密状态信息", description="获取当前使用的卡密的剩余时间、有效状态等基本信息。")
-def skill_get_card_info(auth: dict = Depends(get_current_card)):
+def skill_get_card_info(auth: dict = Depends(get_current_card_skill)):
     from db.session import SessionLocal
     from db.models import Card
     import time
@@ -241,7 +246,7 @@ def skill_get_card_info(auth: dict = Depends(get_current_card)):
         db.close()
 
 @router.post("/check_accounts", summary="巡检官方账号状态", description="查询当前卡密名下是否绑定了喜马拉雅账号，以及账号是否失效。")
-def skill_check_accounts(auth: dict = Depends(get_current_card)):
+def skill_check_accounts(auth: dict = Depends(get_current_card_skill)):
     accounts = list_accounts(auth["card_id"])
     if not accounts:
         return {
@@ -263,8 +268,38 @@ import io
 import zipfile
 import json
 
-@router.get("/export_openapi", summary="导出 AI Skills 配置", description="下载专属的 OpenAPI 规范，内置了当前卡密。")
-async def export_skills_openapi(request: Request, token: str):
+@router.post("/rotate_token", summary="作废并重签 SKILL 专用凭证", description="网页登录后调用。旧的 OpenAPI 配置立即失效，需重新下载并导入 AI 平台。网页会话不受影响。")
+async def rotate_skill_token(auth: dict = Depends(get_current_card)):
+    from db.session import SessionLocal
+    from db.models import Card
+    from api.card_helpers import rotate_card_skill_token
+
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(id=auth["card_id"]).first()
+        if not card:
+            raise HTTPException(status_code=404, detail="卡密不存在")
+        rotate_card_skill_token(db, card)
+        return {"success": True, "message": "已作废旧的 SKILL 配置，请重新下载并导入 AI 平台"}
+    finally:
+        db.close()
+
+
+@router.get("/export_openapi", summary="导出 AI Skills 配置", description="需网页登录。下载专属 OpenAPI 规范，内置 SKILL 专用凭证（与网页登录无关）。")
+async def export_skills_openapi(request: Request, auth: dict = Depends(get_current_card_download)):
+    from db.session import SessionLocal
+    from db.models import Card
+    from api.card_helpers import ensure_card_skill_token
+
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(id=auth["card_id"]).first()
+        if not card:
+            raise HTTPException(status_code=404, detail="卡密不存在")
+        skill_token = ensure_card_skill_token(db, card)
+    finally:
+        db.close()
+
     base_url = str(request.base_url).rstrip("/")
     
     openapi_schema = {
@@ -505,11 +540,11 @@ async def export_skills_openapi(request: Request, token: str):
     auth_param = {
         "name": "Authorization",
         "in": "header",
-        "description": "用户的卡密 Token",
+        "description": "SKILL 专用 Token（与网页登录无关）",
         "required": True,
         "schema": {
             "type": "string",
-            "default": f"Bearer {token}"
+            "default": f"Bearer {skill_token}"
         }
     }
 
@@ -530,7 +565,7 @@ async def export_skills_openapi(request: Request, token: str):
 1. 登录 Coze 工作台，进入“插件” -> “创建插件” -> 选择“导入”。
 2. 将本压缩包内的 `ai_skills_config.json` 文件上传。
 3. 平台会自动识别出全部 API 工具。
-4. **⚠️ 重要安全特性：** 该 JSON 已自动为您硬编码了您当前的卡密凭证 (`Bearer {token}`)。您不需要配置复杂的 API Key 授权，直接保存即可使用！
+4. **⚠️ 重要安全特性：** 该 JSON 已自动内置 SKILL 专用凭证（`Bearer sk_…`），与网页登录/踢下线/换网络无关。卡密过期、被禁用，或在网页端「作废 SKILL 配置」后立即失效。泄露后请到网页使用说明页重新生成。
 
 ## 推荐的 AI 提示词 (Prompt)
 您可以直接将以下文案复制到您 Bot 的“系统提示词”中：
@@ -559,11 +594,11 @@ async def export_skills_openapi(request: Request, token: str):
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="ai_skills_config_{token[:4]}.zip"'}
+        headers={"Content-Disposition": f'attachment; filename="ai_skills_config_{auth["code"][-4:]}.zip"'}
     )
 
 @router.post("/list_downloaded_books", summary="查看已完成下载的书籍", description="列出当前卡密服务器本地下载目录里已经下完的书籍（书名、集数、体积）。用户说「看看下完了哪些书」时调用。")
-async def skill_list_downloaded_books(auth: dict = Depends(get_current_card)):
+async def skill_list_downloaded_books(auth: dict = Depends(get_current_card_skill)):
     from core.quark_sync import scan_card_albums
     albums = scan_card_albums(auth["code"])
     if not albums:
@@ -576,7 +611,7 @@ async def skill_list_downloaded_books(auth: dict = Depends(get_current_card)):
 
 
 @router.post("/sync_book_to_quark", summary="把指定已下载书籍同步到夸克网盘", description="仅后台开通「夸克同步」的卡密可用。按书名（可模糊）把服务器本地音频复制到夸克挂载目录 yousheng/{书名}/，成功后保留本地文件。立即返回 job_id，请再用 check_quark_sync 查进度。")
-async def skill_sync_book_to_quark(req: BookNameRequest, auth: dict = Depends(get_current_card)):
+async def skill_sync_book_to_quark(req: BookNameRequest, auth: dict = Depends(get_current_card_skill)):
     from api.deps import ensure_quark_sync_allowed
     from core import quark_sync as qs
     try:
@@ -609,7 +644,7 @@ async def skill_sync_book_to_quark(req: BookNameRequest, auth: dict = Depends(ge
 
 
 @router.post("/check_quark_sync", summary="查询夸克同步进度", description="用 sync_book_to_quark 返回的 job_id 查询复制进度；不传 job_id 则返回该卡密最近的同步任务。")
-async def skill_check_quark_sync(req: QuarkJobIdRequest = QuarkJobIdRequest(), auth: dict = Depends(get_current_card)):
+async def skill_check_quark_sync(req: QuarkJobIdRequest = QuarkJobIdRequest(), auth: dict = Depends(get_current_card_skill)):
     from api.deps import ensure_quark_sync_allowed
     from core import quark_sync as qs
     try:
@@ -640,7 +675,7 @@ async def skill_check_quark_sync(req: QuarkJobIdRequest = QuarkJobIdRequest(), a
 
 
 @router.post("/check_local_tasks", summary="查询浏览器插件本地下载状态", description="查询当前卡密下有哪些书籍正在通过浏览器插件（本地电脑）下载，或者在排队等待下载，以及进度和报错信息。")
-async def skill_check_local_tasks(auth: dict = Depends(get_current_card)):
+async def skill_check_local_tasks(auth: dict = Depends(get_current_card_skill)):
     resp = await list_local_tasks(auth=auth)
     if not resp.get("success"):
         return resp

@@ -181,6 +181,17 @@ async function kickSessions() {
   finally { devMgr.busy = false }
 }
 
+async function rotateSkillToken() {
+  if (!confirm('作废该卡密的 SKILL 配置？已导入 AI 平台的旧配置会立刻失效，网页/插件登录不受影响。')) return
+  devMgr.busy = true
+  try {
+    const r = await adminApi.post(`/cards/${devMgr.card.id}/skill-token/rotate`)
+    if (r.data.success) { toast.success(r.data.message || '已作废 SKILL 配置'); load() }
+    else toast.error(r.data.error || '操作失败')
+  } catch (e) { toast.error(e.response?.data?.detail || '操作失败') }
+  finally { devMgr.busy = false }
+}
+
 async function delCard(id) {
   if (!confirm('确认删除该卡密？其任务与记录将一并删除（磁盘文件保留）。')) return
   try {
@@ -388,9 +399,10 @@ onMounted(() => { load(); loadInterfaces() })
           <div v-else class="muted" style="font-size:12px;padding:4px 0">（未绑定网络）</div>
         </template>
 
-        <div style="display:flex;gap:10px;margin-top:14px;justify-content:flex-end">
+        <div style="display:flex;gap:10px;margin-top:14px;justify-content:flex-end;flex-wrap:wrap">
           <button class="ghost" :disabled="devMgr.busy" @click="kickSessions">踢下线全部会话</button>
           <button class="ghost" :disabled="devMgr.busy" @click="unbindAllDevices">解绑全部网络</button>
+          <button class="ghost" :disabled="devMgr.busy" @click="rotateSkillToken">作废 SKILL 钥匙</button>
           <button class="success" @click="devMgr.show=false">关闭</button>
         </div>
       </div>
