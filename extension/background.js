@@ -1209,6 +1209,25 @@ async function runTrack(taskId, trackId) {
   }
 }
 
+// 证书失效源站清单：这些域名的 TLS 证书过期/无效，Chrome 对 chrome.downloads 发起的
+// HTTPS 请求不弹证书警告页，直接以 NETWORK_FAILED 中断（地址栏手动访问可点「继续前往」，
+// 但 API 下载永远不行）。命中域名自动降级为 http 明文下载绕开证书校验。
+const CERT_BROKEN_HOSTS = ['ting13.top']
+function downgradeCertBrokenUrl(url) {
+  // 快速路径：非 https / 解析失败 / 未命中清单 → 原样返回，不做任何 URL 规范化
+  if (!url || !url.startsWith('https://')) return url
+  let hostname = ''
+  try { hostname = new URL(url).hostname } catch (e) { return url }
+  const hit = CERT_BROKEN_HOSTS.some(h => hostname === h || hostname.endsWith('.' + h))
+  if (!hit) return url
+  console.warn('[plugin] 源站证书异常，已降级为 http:', hostname)
+  try {
+    const u = new URL(url)
+    u.protocol = 'http:'
+    return u.toString()
+  } catch (e) { return url.replace(/^https:\/\//, 'http://') }
+}
+
 async function resolveForTrack(task, tr, ctx) {
   if (task.source === 'official') {
     const sign = await getSign()
@@ -1219,7 +1238,8 @@ async function resolveForTrack(task, tr, ctx) {
   const resolver = globalThis.RESOLVERS[task.source]
   if (!resolver) throw new Error(`未实现解析器: ${task.source}（本地下载要求 extension/sources/ 下有同名脚本注册该音源。若后端新增了脚本接口，需在 sources/ 放对应 JS 脚本、并在 sources.config.js 的 PLUGIN_SOURCES 登记；否则请改用网页端「服务器端下载」）`)
   const res = await resolver(tr, { serverUrl: ctx.serverUrl, token: ctx.token, quality: task.quality, fmt: task.fmt, albumId: task.album_id })
-  return typeof res === 'string' ? res : (res.url || '')
+  const url = typeof res === 'string' ? res : (res.url || '')
+  return downgradeCertBrokenUrl(url)
 }
 
 // ── 监听 chrome.downloads 状态变化 ──
