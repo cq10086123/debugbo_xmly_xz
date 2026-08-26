@@ -113,6 +113,54 @@ def persist_record(card_id, task_id, album_id, album_title, track_id,
         db.close()
 
 
+def get_task_row(task_id: str, card_id: Optional[int] = None) -> Optional[dict]:
+    """只读查询单个任务行（任意 engine），不修改任何状态。
+
+    与 load_tasks_from_db 的区别：后者是「启动恢复」语义，会把 running 改写成
+    interrupted；查询进度这类读路径绝不能有副作用，故单列此函数。
+
+    card_id 传入时做归属校验（跨卡查询一律视为不存在）。
+    """
+    if not task_id:
+        return None
+    db = SessionLocal()
+    try:
+        row = db.query(DownloadTask).filter_by(task_id=task_id).first()
+        if row is None:
+            return None
+        if card_id is not None and row.card_id != card_id:
+            return None
+        failed_list = json.loads(row.failed_list) if row.failed_list else []
+        total = row.total or 0
+        done = (row.completed or 0) + (row.skipped_count or 0)
+        return {
+            "task_id": row.task_id,
+            "card_id": row.card_id,
+            "engine": row.engine or "official",
+            "interface_name": row.engine or "official",
+            "album_id": row.album_id,
+            "album_title": row.album_title or "",
+            "status": row.status or "",
+            "total": total,
+            "current": row.current or 0,
+            "current_title": row.current_title or "",
+            "completed": row.completed or 0,
+            "skipped_count": row.skipped_count or 0,
+            "failed_list": failed_list,
+            "failed_count": len(failed_list),
+            "error": row.error or "",
+            "percent": round(done / total * 100) if total > 0 else 0,
+            "fmt": row.fmt or "mp3",
+            "started_at": _ts(row.created_at),
+            "finished_at": _ts(row.finished_at),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"get_task_row({task_id}) 失败：{e}")
+        return None
+    finally:
+        db.close()
+
+
 def load_tasks_from_db(engine: str) -> dict:
     """启动时从数据库恢复任务，将 running/cancelling 标记为 interrupted
 

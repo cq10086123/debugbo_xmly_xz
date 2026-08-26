@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,6 +23,8 @@ from api.download import (
 from core import config as _config
 from core.account_manager import list_accounts
 from api.extension import list_local_tasks, create_local_task, CreateTaskRequest
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/skills", tags=["AI_Skills"])
 
@@ -156,36 +159,290 @@ async def skill_submit_download(req: DownloadSubmitRequest, auth: dict = Depends
         return {"success": False, "error": str(e)}
 
 
-@router.post("/check_task_status", summary="查询下载任务进度", description="使用 submit_download 返回的 task_id 查询实时进度、失败情况。")
+@router.post("/check_task_status", summary="查询下载任务进度", description="使用 submit_download 返回的 task_id 查询实时进度、失败情况。自动覆盖官方接口、第三方接口与浏览器插件本地任务。")
 async def skill_check_task_status(req: TaskIdRequest, auth: dict = Depends(get_current_card_skill)):
-    status_resp = await get_batch_status(req.task_id, auth=auth)
-    if not status_resp.get("success"):
-        return status_resp
-    
-    summary = {
-        "success": True,
-        "task_id": req.task_id,
-        "status": status_resp.get("status"),
-        "total": status_resp.get("total"),
-        "completed": status_resp.get("completed"),
-        "skipped": status_resp.get("skipped", 0),
-        "percent": status_resp.get("percent"),
-        "failed_count": len(status_resp.get("failed_list", [])),
-        "errors": status_resp.get("failed_list", [])[:5]  
-    }
-    
-    if summary["status"] == "running":
-        summary["suggestion"] = "任务正在下载中，请告诉用户当前进度，稍后可再次查询。"
-    elif summary["status"] == "done":
-        summary["suggestion"] = "下载已完成！"
-    elif summary["status"] == "error" or summary["failed_count"] > 0:
+    """按 task_id 查询进度——依次穿透四个任务登记处。
+
+    历史 bug：本接口只查 `_batch_tasks`（官方引擎内存字典），而第三方接口的批量任务
+    登记在 `api.interfaces._intf_tasks`、插件任务在 `local_tasks` 表，
+    于是「第三方任务明明在跑，查询却返回任务不存在」。
+    查询顺序：官方内存 → 第三方内存 → 本地插件表 → download_tasks 表（重启后兜底）。
+    """
+    task_id = (req.task_id or "").strip()
+    if not task_id:
+        return {"success": False, "error": "task_id 不能为空"}
+
+    summary: Optional[dict] = None
+
+    # ① 官方引擎（内存实时状态）
+    status_resp = await get_batch_status(task_id, auth=auth)
+    if status_resp.get("success"):
+        summary = {
+            "task_id": task_id,
+            "source": status_resp.get("interface_name", "official"),
+            "task_type": "server",
+            "album_title": status_resp.get("album_title", ""),
+            "status": status_resp.get("status"),
+            "total": status_resp.get("total"),
+            "completed": status_resp.get("completed"),
+            "skipped": status_resp.get("skipped_count", 0),
+            "percent": status_resp.get("percent"),
+            "current_title": status_resp.get("current_title", ""),
+            "eta_text": status_resp.get("eta_text", ""),
+            "failed_count": len(status_resp.get("failed_list", [])),
+            "errors": status_resp.get("failed_list", [])[:5],
+            "error_msg": status_resp.get("error", ""),
+        }
+
+    # ② 第三方接口批量任务（内存实时状态）
+    if summary is None:
+        from api.interfaces import get_intf_task
+        intf_resp = await get_intf_task(task_id, auth=auth)
+        if intf_resp.get("success"):
+            summary = {
+                "task_id": task_id,
+                "source": intf_resp.get("interface", ""),
+                "task_type": "server",
+                "album_title": intf_resp.get("album_title", ""),
+                "status": intf_resp.get("status"),
+                "total": intf_resp.get("total"),
+                "completed": intf_resp.get("completed"),
+                "skipped": intf_resp.get("skipped_count", 0),
+                "percent": intf_resp.get("percent"),
+                "current_title": intf_resp.get("current_title", ""),
+                "failed_count": len(intf_resp.get("failed_list", [])),
+                "errors": intf_resp.get("failed_list", [])[:5],
+                "error_msg": intf_resp.get("error", "") or intf_resp.get("last_error", ""),
+            }
+
+    # ③ 浏览器插件本地任务（local_tasks 表）
+    if summary is None:
+        summary = _local_task_summary(task_id, auth["card_id"])
+
+    # ④ download_tasks 表兜底：服务重启后内存字典清空，但数据库仍有该行
+    if summary is None:
+        from api.persistence import get_task_row
+        row = get_task_row(task_id, auth["card_id"])
+        if row:
+            summary = {
+                "task_id": task_id,
+                "source": row.get("interface_name", "official"),
+                "task_type": "server",
+                "album_title": row.get("album_title", ""),
+                "status": row.get("status"),
+                "total": row.get("total"),
+                "completed": row.get("completed"),
+                "skipped": row.get("skipped_count", 0),
+                "percent": row.get("percent"),
+                "current_title": row.get("current_title", ""),
+                "failed_count": row.get("failed_count", 0),
+                "errors": row.get("failed_list", [])[:5],
+                "error_msg": row.get("error", ""),
+                "from_db": True,
+            }
+
+    if summary is None:
+        return _task_not_found(task_id, auth["card_id"])
+
+    summary["success"] = True
+    status = summary.get("status") or ""
+    failed_count = summary.get("failed_count") or 0
+
+    if status in ("running", "pending", "cancelling"):
+        if status == "pending":
+            summary["suggestion"] = "任务在排队等待浏览器插件接管，请提醒用户打开浏览器并启用插件。"
+        elif status == "cancelling":
+            summary["suggestion"] = "任务正在取消中，稍后可再次查询确认已停止。"
+        else:
+            summary["suggestion"] = "任务正在下载中，请告诉用户当前进度，稍后可再次查询。"
+    elif status == "done":
+        summary["suggestion"] = (
+            f"下载已完成，但有 {failed_count} 集失败，可以提示用户使用 retry_task 重试。"
+            if failed_count else "下载已完成！"
+        )
+    elif status == "interrupted":
+        summary["suggestion"] = "任务因服务器重启而中断，可提示用户在网页任务列表点击「继续」恢复下载。"
+    elif status in ("error", "failed") or failed_count > 0:
         summary["suggestion"] = "有部分文件下载失败或任务出错，可以提示用户使用 retry_task 接口重试。"
-        
+    elif status == "cancelled":
+        summary["suggestion"] = "任务已被取消。"
+
     return summary
 
-@router.post("/retry_task", summary="重试失败的下载任务", description="当 check_task_status 显示有失败项时，调用此接口触发重试。")
+
+@router.post("/list_active_downloads", summary="列出当前所有正在进行的下载", description="不需要 task_id。汇总当前卡密下所有进行中的下载（官方接口、第三方接口、浏览器插件本地下载）。当用户问「现在下载到哪了」但你没有 task_id、或 check_task_status 返回任务不存在时，优先调用此接口。")
+async def skill_list_active_downloads(auth: dict = Depends(get_current_card_skill)):
+    from api.download import list_batch_tasks
+    from api.interfaces import list_intf_tasks
+    from core import download_slot
+
+    active_states = ("running", "pending", "cancelling")
+    tasks: list[dict] = []
+
+    # 官方引擎
+    try:
+        off = await list_batch_tasks(auth=auth)
+        for t in off.get("tasks", []):
+            if t.get("status") in active_states:
+                tasks.append({
+                    "task_id": t.get("task_id"), "task_type": "server",
+                    "source": t.get("interface_name", "official"),
+                    "album_title": t.get("album_title", ""), "status": t.get("status"),
+                    "total": t.get("total"), "completed": t.get("completed"),
+                    "percent": t.get("percent"), "eta_text": t.get("eta_text", ""),
+                    "current_title": t.get("current_title", ""),
+                    "failed_count": t.get("failed_count", 0),
+                })
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"列出官方任务失败: {e}")
+
+    # 第三方接口
+    try:
+        intf = await list_intf_tasks(auth=auth)
+        for t in intf.get("tasks", []):
+            if t.get("status") in active_states:
+                tasks.append({
+                    "task_id": t.get("task_id"), "task_type": "server",
+                    "source": t.get("interface", ""),
+                    "album_title": t.get("album_title", ""), "status": t.get("status"),
+                    "total": t.get("total"), "completed": t.get("completed"),
+                    "percent": t.get("percent"),
+                    "current_title": t.get("current_title", ""),
+                    "failed_count": t.get("failed_count", 0),
+                })
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"列出第三方任务失败: {e}")
+
+    # 浏览器插件本地任务
+    try:
+        loc = await list_local_tasks(auth=auth)
+        for t in loc.get("tasks", []):
+            s = _local_task_summary(t.get("task_id"), auth["card_id"])
+            if s and s.get("status") in active_states:
+                tasks.append({
+                    "task_id": s["task_id"], "task_type": "local", "source": s["source"],
+                    "album_title": s["album_title"], "status": s["status"],
+                    "total": s["total"], "completed": s["completed"],
+                    "percent": s["percent"], "failed_count": s["failed_count"],
+                })
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"列出本地任务失败: {e}")
+
+    if tasks:
+        return {
+            "success": True, "active_count": len(tasks), "tasks": tasks,
+            "suggestion": "把上面每个任务的书名与进度百分比告诉用户；后续可用对应 task_id 调用 check_task_status 追踪。",
+        }
+
+    # 一个都没有，但下载槽仍被占用 → 状态不一致，如实说明
+    try:
+        holder = download_slot.get_lock(auth["card_id"])
+    except Exception:  # noqa: BLE001
+        holder = None
+    if holder and not holder.get("expired"):
+        return {
+            "success": True, "active_count": 0, "tasks": [],
+            "slot_holder": holder,
+            "suggestion": (
+                f"任务列表为空，但下载槽仍被 task_id={holder.get('task_id')}"
+                f"（来源 {holder.get('source')}）占用且心跳正常。"
+                "这通常意味着服务重启过、进程内任务状态已丢失。"
+                "请提示用户到网页任务列表查看，或稍等租约过期后重新提交。"
+            ),
+        }
+    return {"success": True, "active_count": 0, "tasks": [],
+            "message": "当前没有正在进行的下载任务。"}
+
+
+def _local_task_summary(task_id: str, card_id: int) -> Optional[dict]:
+    """从 local_tasks 表读取插件任务进度（插件心跳写入 progress={total,done,failed}）。"""
+    import json as _json
+    from db.session import SessionLocal
+    from db.models import LocalTask
+
+    db = SessionLocal()
+    try:
+        t = db.query(LocalTask).filter_by(task_id=task_id, card_id=card_id).first()
+        if not t:
+            return None
+        prog = _json.loads(t.progress) if t.progress else {}
+        tracks = _json.loads(t.tracks or "[]")
+        failed_list = _json.loads(t.failed_list) if t.failed_list else []
+        total = prog.get("total") or len(tracks)
+        # 插件写的是 done/failed；旧数据可能是 completed/skipped
+        completed = prog.get("done", prog.get("completed", 0)) or 0
+        skipped = prog.get("skipped", 0) or 0
+        return {
+            "task_id": task_id,
+            "source": t.source,
+            "task_type": "local",
+            "album_title": t.album_title or "",
+            "status": t.status,
+            "total": total,
+            "completed": completed,
+            "skipped": skipped,
+            "percent": round((completed + skipped) / total * 100) if total else 0,
+            "failed_count": prog.get("failed", len(failed_list)) or 0,
+            "errors": failed_list[:5],
+            "error_msg": t.error or "",
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"读取本地任务 {task_id} 失败: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def _task_not_found(task_id: str, card_id: int) -> dict:
+    """任务四处皆无：结合下载槽给出可执行的诊断，而不是干巴巴一句「任务不存在」。"""
+    from core import download_slot
+
+    hint = (
+        "已查询官方任务、第三方接口任务、浏览器插件任务与历史任务记录，均无此 task_id。"
+        "请确认 task_id 是否抄写正确、是否属于当前卡密。"
+    )
+    try:
+        holder = download_slot.get_lock(card_id)
+    except Exception:  # noqa: BLE001
+        holder = None
+    if holder and not holder.get("expired"):
+        hint += (
+            f" 注意：该卡密当前确实有下载在进行中——"
+            f"task_id={holder.get('task_id')}、来源={holder.get('source')}、"
+            f"类型={'浏览器插件' if holder.get('holder_type') == 'local' else '服务器'}"
+            f"《{holder.get('album_title') or '未知'}》。"
+            f"请改用这个 task_id 查询进度。"
+        )
+    return {"success": False, "error": "任务不存在", "task_id": task_id, "suggestion": hint}
+
+@router.post("/retry_task", summary="重试失败的下载任务", description="当 check_task_status 显示有失败项时，调用此接口触发重试。目前仅官方接口任务支持自动重试。")
 async def skill_retry_task(req: TaskIdRequest, auth: dict = Depends(get_current_card_skill)):
-    return await retry_batch_failed(req.task_id, auth=auth)
+    resp = await retry_batch_failed(req.task_id, auth=auth)
+    if resp.get("success"):
+        return resp
+
+    # 官方任务里没找到 → 可能是第三方 / 本地插件任务，给出准确说明而不是「原任务不存在」
+    from api.interfaces import get_intf_task
+    intf_resp = await get_intf_task(req.task_id, auth=auth)
+    if intf_resp.get("success"):
+        return {
+            "success": False,
+            "error": "第三方接口任务暂不支持一键重试",
+            "suggestion": (
+                f"任务《{intf_resp.get('album_title') or req.task_id}》来自第三方接口 "
+                f"{intf_resp.get('interface')}，请提示用户在网页任务列表中对该任务重新提交下载"
+                "（已下载的集数会自动跳过，不会重复下载）。"
+            ),
+        }
+
+    local = _local_task_summary(req.task_id, auth["card_id"])
+    if local:
+        return {
+            "success": False,
+            "error": "浏览器插件本地任务不支持此重试接口",
+            "suggestion": "这是浏览器插件的本地下载任务。若卡死请改用 reset_stuck_local_task 重置。",
+        }
+    return resp
 
 
 @router.post("/reset_stuck_local_task", summary="重置卡死的本地插件任务", description="当 check_local_tasks 发现有任务长时间卡在 running 状态进度不动，或者是由于浏览器崩溃导致的僵尸任务时，调用此接口将其重置为 pending，让插件能重新接管下载。")
@@ -393,10 +650,18 @@ async def export_skills_openapi(request: Request, auth: dict = Depends(get_curre
                     "responses": {"200": {"description": "成功"}}
                 }
             },
+            "/api/skills/list_active_downloads": {
+                "post": {
+                    "summary": "列出当前所有正在进行的下载",
+                    "description": "不需要 task_id。汇总当前卡密下所有进行中的下载（官方接口、第三方接口、浏览器插件本地下载）。当用户问「现在下载到哪了」但你没有 task_id、或 check_task_status 返回任务不存在时，优先调用此接口。",
+                    "operationId": "skill_list_active_downloads",
+                    "responses": {"200": {"description": "成功"}}
+                }
+            },
             "/api/skills/check_task_status": {
                 "post": {
                     "summary": "查询下载任务进度",
-                    "description": "使用 submit_download 返回的 task_id 查询实时进度、失败情况。",
+                    "description": "使用 submit_download 返回的 task_id 查询实时进度、失败情况。自动覆盖官方接口、第三方接口与浏览器插件本地任务。若返回任务不存在，请改调用 list_active_downloads 查看当前所有进行中的下载。",
                     "operationId": "skill_check_task_status",
                     "requestBody": {
                         "required": True,
@@ -418,7 +683,7 @@ async def export_skills_openapi(request: Request, auth: dict = Depends(get_curre
             "/api/skills/retry_task": {
                 "post": {
                     "summary": "重试失败的下载任务",
-                    "description": "当 check_task_status 显示有失败项时，调用此接口触发重试。",
+                    "description": "当 check_task_status 显示有失败项时，调用此接口触发重试。目前仅官方接口任务支持自动重试；第三方接口任务需在网页重新提交。",
                     "operationId": "skill_retry_task",
                     "requestBody": {
                         "required": True,
@@ -687,12 +952,14 @@ async def skill_check_local_tasks(auth: dict = Depends(get_current_card_skill)):
     summary_list = []
     for t in tasks:
         prog = t.get("progress") or {}
-        total = prog.get("total", len(t.get("tracks", [])) or 1)
-        completed = prog.get("completed", 0)
-        skipped = prog.get("skipped", 0)
+        total = prog.get("total") or len(t.get("tracks", [])) or 0
+        # 插件心跳写入的键是 done/failed（见 extension/background.js），
+        # 旧代码读的是 completed → 进度永远显示 0。两种键都兼容。
+        completed = prog.get("done", prog.get("completed", 0)) or 0
+        skipped = prog.get("skipped", 0) or 0
 
         failed_list = t.get("failed_list", [])
-        failed_count = len(failed_list)
+        failed_count = prog.get("failed", len(failed_list)) or 0
         failed_details = []
         for f_item in failed_list[:3]:
             if isinstance(f_item, dict):
@@ -703,9 +970,12 @@ async def skill_check_local_tasks(auth: dict = Depends(get_current_card_skill)):
         summary_list.append({
             "task_id": t.get("task_id"),
             "album_title": t.get("album_title"),
+            "source": t.get("source"),
             "status": t.get("status"), 
             "total_episodes": total,
             "completed": completed,
+            "skipped": skipped,
+            "percent": round((completed + skipped) / total * 100) if total else 0,
             "failed_count": failed_count,
             "failed_details": failed_details,
             "error_msg": t.get("error", "")
