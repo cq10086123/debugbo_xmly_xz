@@ -46,6 +46,7 @@ from api.accounts import router as accounts_router
 from api.search import router as search_router
 from api.files import router as files_router
 from api.log_router import router as log_router
+from api.skills import router as skills_router
 from api.interfaces import router as interfaces_router, admin_router as interfaces_admin_router
 from api.extension import router as extension_router
 from api.announcements import router as announcements_router, admin_router as announcements_admin_router
@@ -223,6 +224,7 @@ app.include_router(admin_router, prefix=f"/api/{_ADMIN_PATH}")
 app.include_router(interfaces_admin_router, prefix=f"/api/{_ADMIN_PATH}")
 app.include_router(announcements_admin_router, prefix=f"/api/{_ADMIN_PATH}")
 app.include_router(log_router, prefix=f"/api/{_ADMIN_PATH}/log")
+app.include_router(skills_router)
 
 
 # 静态托管前端构建产物（若存在）
