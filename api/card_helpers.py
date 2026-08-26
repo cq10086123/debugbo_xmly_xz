@@ -1,10 +1,16 @@
 """卡密策略与公共信息辅助函数（auth / admin / 后台清理任务共用）"""
 
 import json
+import secrets
+import threading
 from datetime import datetime, timedelta, timezone
 
 from db.models import Card
 from db.init_db import log_card_event
+
+# SKILL 专用 token 签发互斥（查重 → 写入非原子，低频操作用进程内锁即可）
+_SKILL_TOKEN_LOCK = threading.Lock()
+SKILL_TOKEN_PREFIX = "sk_"
 
 
 def _now() -> datetime:
@@ -104,5 +110,48 @@ def card_public_info(card: Card) -> dict:
         "download_mode": getattr(card, "download_mode", None) or "both",
         "max_devices": getattr(card, "max_devices", None) or 1,
         "quark_sync": bool(getattr(card, "quark_sync", False)),
+        "has_skill_token": bool(getattr(card, "skill_token", None)),
         "last_login_at": card.last_login_at.isoformat() if card.last_login_at else None,
     }
+
+
+def issue_skill_token() -> str:
+    """生成一枚 SKILL 专用 token（带 sk_ 前缀，与网页 session 可区分）。"""
+    return SKILL_TOKEN_PREFIX + secrets.token_urlsafe(32)
+
+
+def ensure_card_skill_token(db, card: Card) -> str:
+    """若卡密尚无 SKILL token 则签发一枚；已有则原样返回。调用方负责外层会话。"""
+    existing = getattr(card, "skill_token", None)
+    if existing:
+        return existing
+    with _SKILL_TOKEN_LOCK:
+        db.refresh(card)
+        if card.skill_token:
+            return card.skill_token
+        for _ in range(8):
+            tok = issue_skill_token()
+            clash = db.query(Card).filter_by(skill_token=tok).first()
+            if clash is None:
+                card.skill_token = tok
+                db.commit()
+                log_card_event("skill_token", card.id, f"卡密 {card.code} 签发 SKILL 专用 token")
+                return tok
+        raise RuntimeError("无法签发 SKILL token")
+
+
+def rotate_card_skill_token(db, card: Card) -> str:
+    """作废旧 SKILL token 并签发新的。旧 OpenAPI 配置立即失效。"""
+    with _SKILL_TOKEN_LOCK:
+        for _ in range(8):
+            tok = issue_skill_token()
+            clash = db.query(Card).filter_by(skill_token=tok).first()
+            if clash is None or clash.id == card.id:
+                card.skill_token = tok
+                db.commit()
+                log_card_event(
+                    "skill_token_rotate", card.id,
+                    f"卡密 {card.code} 作废并重签 SKILL token",
+                )
+                return tok
+        raise RuntimeError("无法重签 SKILL token")

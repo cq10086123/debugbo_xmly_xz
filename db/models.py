@@ -58,6 +58,9 @@ class Card(Base):
     max_devices = mapped_column(Integer, nullable=True)
     # 是否允许把已下载专辑同步到宿主机夸克挂载目录（默认关；仅管理员给指定卡密打开）
     quark_sync = mapped_column(Boolean, default=False, nullable=False)
+    # SKILL 专用长期凭证（与网页/插件 session 解耦；NULL=尚未签发）
+    # 鉴权走 get_current_card_skill：跳过网络绑定与 IP 风控，仍受卡密过期/禁用约束
+    skill_token = mapped_column(String(80), unique=True, nullable=True, index=True)
     created_at = mapped_column(DateTime, default=_utcnow, nullable=False)
     last_login_at = mapped_column(DateTime, nullable=True)
 

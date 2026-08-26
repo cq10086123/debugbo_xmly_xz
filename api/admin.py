@@ -52,7 +52,9 @@ from db.models import (
     Session as CardSession,
 )
 from api.deps import get_current_admin
-from api.card_helpers import card_public_info, is_expired, dump_bound_interfaces, _aware
+from api.card_helpers import (
+    card_public_info, is_expired, dump_bound_interfaces, _aware, rotate_card_skill_token,
+)
 from core import config as _config
 from core import login as login_module
 from core import account_manager as _am
@@ -568,6 +570,20 @@ async def kick_card_sessions(card_id: int, _: bool = Depends(get_current_admin))
         n = dvb.kick_all_sessions(db, card)
         db.commit()
         return {"success": True, "message": f"已踢下线 {n} 个会话（设备绑定保留）", "kicked": n}
+    finally:
+        db.close()
+
+
+@router.post("/cards/{card_id}/skill-token/rotate")
+async def rotate_card_skill_token_admin(card_id: int, _: bool = Depends(get_current_admin)):
+    """作废该卡密的 SKILL 专用凭证并重签。网页/插件会话不受影响；旧 OpenAPI 立即失效。"""
+    db = SessionLocal()
+    try:
+        card = db.query(Card).filter_by(id=card_id).first()
+        if not card:
+            raise HTTPException(status_code=404, detail="卡密不存在")
+        rotate_card_skill_token(db, card)
+        return {"success": True, "message": "已作废旧的 SKILL 配置，用户需重新导出并导入 AI 平台"}
     finally:
         db.close()
 

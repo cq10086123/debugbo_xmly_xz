@@ -1,6 +1,8 @@
 <script setup>
-import { getBizToken } from '../utils/request'
+import { getBizToken, bizApi } from '../utils/request'
+import { useToast } from '../utils/toast'
 
+const toast = useToast()
 
 function downloadSkills() {
   const token = getBizToken()
@@ -10,10 +12,25 @@ function downloadSkills() {
   }
   const a = document.createElement('a')
   a.href = `/api/skills/export_openapi?token=${encodeURIComponent(token)}`
-  a.download = `ai_skills_config_${token.substring(0,4)}.json`
+  a.download = 'ai_skills_config.zip'
   document.body.appendChild(a)
   a.click()
   a.remove()
+}
+
+async function rotateSkills() {
+  if (!getBizToken()) {
+    alert('请先登录卡密')
+    return
+  }
+  if (!confirm('作废后，已导入 Coze/Dify 的旧配置会立刻失效，需要重新下载并导入。网页登录不受影响。确定作废？')) return
+  try {
+    const r = await bizApi.post('/skills/rotate_token')
+    if (r.data.success) toast.success(r.data.message || '已作废，请重新下载配置')
+    else toast.error(r.data.error || '作废失败')
+  } catch (e) {
+    toast.error(e.response?.data?.detail || '作废失败')
+  }
 }
 
 function downloadExtension() {
@@ -118,8 +135,9 @@ function downloadExtension() {
 
     <section class="card-panel pad">
       <h2>🤖 AI 助手 Skills 配置下载</h2>
-      <p class="muted">如果你想在微信、Coze 或 Dify 等 AI 助手中使用当前卡密通过对话来控制下载，请点击下方下载你的专属 Skills 配置文件。将其导入到 AI 平台中即可使用，里面<b>已自动内置你当前的卡密</b>。</p>
+      <p class="muted">如果你想在微信、Coze 或 Dify 等 AI 助手中通过对话控制下载，请下载专属 Skills 配置并导入。配置内置<b>独立 SKILL 凭证</b>，换设备/网络、网页退出或顶号都不会让 Bot 失效；<b>卡密过期、被禁用或点下方「作废」后立即不能用</b>。下载仍受「同一时间只能下一本」限制。</p>
       <button class="success big" @click="downloadSkills">📥 下载专属 AI Skills 配置</button>
+      <button class="ghost big" style="margin-left:10px" @click="rotateSkills">作废并重新生成</button>
     </section>
 
     <section class="card-panel pad">

@@ -54,12 +54,14 @@ def _migrate_card_columns():
     - download_mode     TEXT  下载模式权限（server/local/both，NULL=both）
     - max_devices       INTEGER  设备绑定数上限（NULL=1，见 core/device_binding.py）
     - quark_sync        INTEGER  是否允许同步到夸克挂载（0=关，默认关）
+    - skill_token       TEXT     SKILL 专用长期凭证（NULL=尚未签发，UNIQUE）
     """
     needed = {
         "bound_interfaces": "TEXT",
         "download_mode": "TEXT",
         "max_devices": "INTEGER",
         "quark_sync": "INTEGER NOT NULL DEFAULT 0",
+        "skill_token": "TEXT",
     }
     with _engine.connect() as conn:
         cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(cards)").fetchall()}
@@ -67,6 +69,10 @@ def _migrate_card_columns():
             if name not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE cards ADD COLUMN {name} {ddl}")
                 logger.info(f"cards 表补充列: {name}")
+        # UNIQUE 允许多个 NULL；存量卡未签发 SKILL 钥匙时 skill_token 为空
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_cards_skill_token ON cards (skill_token)"
+        )
         conn.commit()
 
 
