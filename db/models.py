@@ -56,6 +56,8 @@ class Card(Base):
     # 网络绑定：允许同时绑定的网络（出口 IP）数（默认 1，同一网络下不限设备）
     # NULL → 按 1 处理；由 core/device_binding.py 统一读取，业务代码不直接判空
     max_devices = mapped_column(Integer, nullable=True)
+    # 是否允许把已下载专辑同步到宿主机夸克挂载目录（默认关；仅管理员给指定卡密打开）
+    quark_sync = mapped_column(Boolean, default=False, nullable=False)
     created_at = mapped_column(DateTime, default=_utcnow, nullable=False)
     last_login_at = mapped_column(DateTime, nullable=True)
 

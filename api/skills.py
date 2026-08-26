@@ -38,6 +38,12 @@ class DownloadSubmitRequest(BaseModel):
 class TaskIdRequest(BaseModel):
     task_id: str = Field(..., description="下载任务的唯一 task_id")
 
+class BookNameRequest(BaseModel):
+    book_name: str = Field(..., description="已下载书籍的名称（专辑目录名，支持模糊匹配）")
+
+class QuarkJobIdRequest(BaseModel):
+    job_id: str = Field("", description="sync_book_to_quark 返回的 job_id；不传则查询最近任务")
+
 
 @router.post("/get_sources", summary="获取所有可用的音源接口", description="返回系统中当前可用的音源接口列表。大模型在搜索书籍前，可以先调用此接口让用户选择使用哪个音源，或者直接列出给用户看。")
 async def skill_get_sources(auth: dict = Depends(get_current_card)):
@@ -441,6 +447,57 @@ async def export_skills_openapi(request: Request, token: str):
                     "operationId": "skill_get_card_info",
                     "responses": {"200": {"description": "成功"}}
                 }
+            },
+            "/api/skills/list_downloaded_books": {
+                "post": {
+                    "summary": "查看已完成下载的书籍",
+                    "description": "列出当前卡密服务器本地下载目录里已经下完的书籍。用户说「看看下完了哪些书」时调用。",
+                    "operationId": "skill_list_downloaded_books",
+                    "responses": {"200": {"description": "成功"}}
+                }
+            },
+            "/api/skills/sync_book_to_quark": {
+                "post": {
+                    "summary": "把指定已下载书籍同步到夸克网盘",
+                    "description": "仅后台开通「夸克同步」的卡密可用。按书名（可模糊）复制到夸克挂载目录，成功后保留本地文件。",
+                    "operationId": "skill_sync_book_to_quark",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "book_name": {"type": "string", "description": "已下载书籍名称，支持模糊匹配"}
+                                    },
+                                    "required": ["book_name"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "成功"}}
+                }
+            },
+            "/api/skills/check_quark_sync": {
+                "post": {
+                    "summary": "查询夸克同步进度",
+                    "description": "用 sync_book_to_quark 返回的 job_id 查询进度；不传 job_id 则返回最近任务。",
+                    "operationId": "skill_check_quark_sync",
+                    "requestBody": {
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "job_id": {"type": "string", "description": "同步任务 id，可空"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "成功"}}
+                }
             }
         }
     }
@@ -472,7 +529,7 @@ async def export_skills_openapi(request: Request, token: str):
 ## 接入步骤 (以 Coze/扣子 为例)
 1. 登录 Coze 工作台，进入“插件” -> “创建插件” -> 选择“导入”。
 2. 将本压缩包内的 `ai_skills_config.json` 文件上传。
-3. 平台会自动识别出 10 个 API 工具。
+3. 平台会自动识别出全部 API 工具。
 4. **⚠️ 重要安全特性：** 该 JSON 已自动为您硬编码了您当前的卡密凭证 (`Bearer {token}`)。您不需要配置复杂的 API Key 授权，直接保存即可使用！
 
 ## 推荐的 AI 提示词 (Prompt)
@@ -489,6 +546,7 @@ async def export_skills_openapi(request: Request, token: str):
 3. **分步引导（当指令不全时）**：如果用户只说了“帮我搜完美世界”，你就只展示搜索结果，并默默记住所有结果的 `album_id` 和 `source`，然后问用户“要下载哪一本的哪几集？”。
 4. **服务器下载与本地插件**：`skill_submit_download` 只能提交到服务器。如果用户明确要求“本地下载/浏览器下载”，请告诉用户：“抱歉，目前通过微信AI只能触发服务器下载。如果要使用本地下载，请打开您的电脑浏览器前往网页端操作。”
 5. **状态与修复**：如果用户问进度，调用 `skill_check_task_status`；如果遇到 running 卡死，主动提议调用 `skill_reset_stuck_local_task`。
+6. **夸克同步（仅开通该功能的卡密）**：用户说「看看下完了哪些书」时调用 `skill_list_downloaded_books`；说「把某某书同步到夸克」时调用 `skill_sync_book_to_quark`（传入书名，可模糊匹配，多本则列出候选让用户选），然后告诉用户已开始同步，再用 `skill_check_quark_sync` 查进度。未开通会返回错误，如实转告。下载完成不要自动同步。
 """
 
     zip_buffer = io.BytesIO()
@@ -503,6 +561,83 @@ async def export_skills_openapi(request: Request, token: str):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="ai_skills_config_{token[:4]}.zip"'}
     )
+
+@router.post("/list_downloaded_books", summary="查看已完成下载的书籍", description="列出当前卡密服务器本地下载目录里已经下完的书籍（书名、集数、体积）。用户说「看看下完了哪些书」时调用。")
+async def skill_list_downloaded_books(auth: dict = Depends(get_current_card)):
+    from core.quark_sync import scan_card_albums
+    albums = scan_card_albums(auth["code"])
+    if not albums:
+        return {"success": True, "books": [], "suggestion": "当前卡密下还没有已完成的服务器下载书籍。"}
+    return {
+        "success": True,
+        "books": albums,
+        "suggestion": "需要同步到夸克时，调用 sync_book_to_quark 并传入书名；未开通夸克同步的卡密会被拒绝。",
+    }
+
+
+@router.post("/sync_book_to_quark", summary="把指定已下载书籍同步到夸克网盘", description="仅后台开通「夸克同步」的卡密可用。按书名（可模糊）把服务器本地音频复制到夸克挂载目录 yousheng/{书名}/，成功后保留本地文件。立即返回 job_id，请再用 check_quark_sync 查进度。")
+async def skill_sync_book_to_quark(req: BookNameRequest, auth: dict = Depends(get_current_card)):
+    from api.deps import ensure_quark_sync_allowed
+    from core import quark_sync as qs
+    try:
+        ensure_quark_sync_allowed(auth)
+    except HTTPException as e:
+        return {"success": False, "error": e.detail}
+    albums = qs.scan_card_albums(auth["code"])
+    if not albums:
+        return {"success": False, "error": "当前没有已下载完成的书籍。"}
+    hit, candidates = qs.match_album(albums, req.book_name)
+    if not hit:
+        names = [a["name"] for a in candidates[:15]]
+        return {
+            "success": False,
+            "error": "无法唯一确定要同步的书，请让用户从下列书名中选一本。",
+            "candidates": names,
+        }
+    try:
+        job = qs.start_sync(auth["card_id"], auth["code"], hit["name"])
+        return {
+            "success": True,
+            **job,
+            "suggestion": (
+                f"已开始把《{hit['name']}》同步到夸克，请把「已开始同步」告诉用户，"
+                f"稍后用 check_quark_sync 查询 job_id={job['job_id']}。本地文件会保留。"
+            ),
+        }
+    except qs.QuarkSyncError as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/check_quark_sync", summary="查询夸克同步进度", description="用 sync_book_to_quark 返回的 job_id 查询复制进度；不传 job_id 则返回该卡密最近的同步任务。")
+async def skill_check_quark_sync(req: QuarkJobIdRequest = QuarkJobIdRequest(), auth: dict = Depends(get_current_card)):
+    from api.deps import ensure_quark_sync_allowed
+    from core import quark_sync as qs
+    try:
+        ensure_quark_sync_allowed(auth)
+    except HTTPException as e:
+        return {"success": False, "error": e.detail}
+    job_id = (req.job_id if req else "") or ""
+    if job_id:
+        job = qs.get_job(job_id, auth["card_id"])
+        if not job:
+            return {"success": False, "error": "同步任务不存在"}
+        jobs = [job]
+    else:
+        running = qs.running_job_for_card(auth["card_id"])
+        jobs = [running] if running else qs.list_jobs(auth["card_id"])[:3]
+    if not jobs:
+        return {"success": True, "message": "当前没有夸克同步任务。"}
+    out = jobs[0]
+    suggestion = "同步仍在进行，稍后可再查。"
+    if out.get("status") == "done":
+        suggestion = (
+            f"《{out.get('album')}》已同步到夸克（复制 {out.get('copied')}，跳过 {out.get('skipped')}）。"
+            "本地文件仍保留。"
+        )
+    elif out.get("status") == "failed":
+        suggestion = f"同步失败：{out.get('error') or '未知错误'}。本地文件未删除，可以重试。"
+    return {"success": True, "job": out, "suggestion": suggestion}
+
 
 @router.post("/check_local_tasks", summary="查询浏览器插件本地下载状态", description="查询当前卡密下有哪些书籍正在通过浏览器插件（本地电脑）下载，或者在排队等待下载，以及进度和报错信息。")
 async def skill_check_local_tasks(auth: dict = Depends(get_current_card)):

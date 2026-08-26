@@ -103,5 +103,6 @@ def card_public_info(card: Card) -> dict:
         "bound_interfaces": card_bound_interfaces(card),
         "download_mode": getattr(card, "download_mode", None) or "both",
         "max_devices": getattr(card, "max_devices", None) or 1,
+        "quark_sync": bool(getattr(card, "quark_sync", False)),
         "last_login_at": card.last_login_at.isoformat() if card.last_login_at else None,
     }
