@@ -77,6 +77,7 @@ class CardGenerateRequest(BaseModel):
     inject_xm_cookie: bool = False      # 生成时是否把后端供体池账号复制进新卡（免前端扫码）
     download_mode: str | None = None   # 下载模式：server/local/both；None = both（不限制）
     max_devices: int | None = None     # 设备绑定：每席位允许设备数（默认 1）
+    quark_sync: bool = False           # 是否允许同步到夸克挂载（默认关）
 
 
 class CardInjectRequest(BaseModel):
@@ -91,6 +92,7 @@ class CardPatchRequest(BaseModel):
     interface_names: list[str] | None = None  # 传数组则覆盖绑定（空数组=取消限制）；不传则不变
     download_mode: str | None = None   # 下载模式：server/local/both；传 None 则不变，传 'both'/非法值 → 取消限制
     max_devices: int | None = None     # 设备绑定：每席位允许设备数（1~10）；不传则不变
+    quark_sync: bool | None = None     # 是否允许同步到夸克；不传则不变
 
 
 class CardRenewRequest(BaseModel):
@@ -253,6 +255,7 @@ async def generate_cards(req: CardGenerateRequest, _: bool = Depends(get_current
                 bound_interfaces=bound_str,
                 download_mode=dm,
                 max_devices=md,
+                quark_sync=bool(req.quark_sync),
             )
             db.add(card)
             db.flush()
@@ -370,6 +373,9 @@ async def patch_card(card_id: int, req: CardPatchRequest, _: bool = Depends(get_
             if req.max_devices < old_max:
                 # 下调上限：即时裁剪超额绑定（最早绑定的被裁），不等下次登录
                 dvb.trim_bindings_to_limit(db, card)
+
+        if req.quark_sync is not None:
+            card.quark_sync = bool(req.quark_sync)
 
         # 修改到期时间/有效天数后，若按新值实际未过期，复活 expired 状态
         # （is_expired 对 status==expired 恒真，必须绕开它按日期直接判断）

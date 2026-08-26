@@ -53,8 +53,14 @@ def _migrate_card_columns():
     - bound_interfaces TEXT  卡密绑定的接口名列表（JSON 数组，NULL=不限制）
     - download_mode     TEXT  下载模式权限（server/local/both，NULL=both）
     - max_devices       INTEGER  设备绑定数上限（NULL=1，见 core/device_binding.py）
+    - quark_sync        INTEGER  是否允许同步到夸克挂载（0=关，默认关）
     """
-    needed = {"bound_interfaces": "TEXT", "download_mode": "TEXT", "max_devices": "INTEGER"}
+    needed = {
+        "bound_interfaces": "TEXT",
+        "download_mode": "TEXT",
+        "max_devices": "INTEGER",
+        "quark_sync": "INTEGER NOT NULL DEFAULT 0",
+    }
     with _engine.connect() as conn:
         cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(cards)").fetchall()}
         for name, ddl in needed.items():

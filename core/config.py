@@ -38,6 +38,11 @@ _DEFAULT_CONFIG = {
 _DEFAULT_DL = str(BASE_DIR / "downloads")
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", os.environ.get("AUDIO_DIR", _DEFAULT_DL)))
 
+# 夸克挂载目录（容器内路径）。空字符串 = 未配置，同步功能不可用。
+# Docker 示例：宿主机 /vol02/.../yousheng → 容器 /app/quark
+_QUARK_RAW = (os.environ.get("QUARK_SYNC_DIR") or "").strip()
+QUARK_SYNC_DIR = Path(_QUARK_RAW) if _QUARK_RAW else None
+
 # Cookie 保存路径（跟随 DATA_DIR）
 COOKIE_FILE = DATA_DIR / "cookie.txt"
 
@@ -162,7 +167,7 @@ _ADMIN_PATH_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 # 保留前缀：与业务 API 路由、静态资源、FastAPI 内置文档冲突的段不允许用作后台地址
 _ADMIN_PATH_RESERVED = {
     "api", "auth", "search", "download", "files", "log", "interfaces", "intf",
-    "extension", "accounts", "docs", "redoc", "openapi.json", "static", "assets",
+    "extension", "accounts", "quark", "docs", "redoc", "openapi.json", "static", "assets",
     "favicon.ico",
 }
 

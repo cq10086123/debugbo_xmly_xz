@@ -83,6 +83,7 @@ async def _auth_card(raw_token: str, client_ip: str | None = None) -> dict:
             "token": raw_token,
             "bound": card_bound_interfaces(card),
             "download_mode": getattr(card, "download_mode", None) or "both",
+            "quark_sync": bool(getattr(card, "quark_sync", False)),
         }
     finally:
         db.close()
@@ -116,6 +117,15 @@ def ensure_download_mode_allowed(auth: dict, mode: str) -> None:
         raise HTTPException(
             status_code=403,
             detail=f"当前卡密仅允许「{label_allowed}」下载，不可使用「{label_req}」下载",
+        )
+
+
+def ensure_quark_sync_allowed(auth: dict) -> None:
+    """校验当前卡密是否开通「同步到夸克」。默认关；未开通一律 403。"""
+    if not auth.get("quark_sync"):
+        raise HTTPException(
+            status_code=403,
+            detail="当前卡密未开通夸克同步，请联系管理员在后台开启",
         )
 
 

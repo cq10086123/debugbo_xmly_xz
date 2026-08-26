@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { bizApi, getBizToken } from '../utils/request'
 import { useToast } from '../utils/toast'
 
@@ -9,6 +9,11 @@ const albums = ref([])      // 专辑分组
 const loading = ref(true)
 const cleaning = ref(false)
 const albumExpanded = ref({}) // 专辑名 -> 是否展开，默认折叠
+const quarkAllowed = ref(false)
+const quarkMounted = ref(false)
+const quarkMountError = ref('')
+const syncJobs = ref({})    // album -> {job_id, status, done, total, error}
+let pollTimer = null
 
 function isExpanded(name) { return !!albumExpanded.value[name] }
 function toggleAlbum(name) { albumExpanded.value[name] = !isExpanded(name) }
@@ -85,7 +90,94 @@ async function cleanup() {
   finally { cleaning.value = false }
 }
 
-onMounted(load)
+async function loadQuark() {
+  try {
+    const r = await bizApi.get('/quark/status')
+    if (r.data.success) {
+      quarkAllowed.value = !!r.data.allowed
+      quarkMounted.value = !!r.data.mounted
+      quarkMountError.value = r.data.mount_error || ''
+      const running = r.data.running
+      if (running && running.album) {
+        syncJobs.value = { ...syncJobs.value, [running.album]: running }
+        if (running.status === 'running') startPoll()
+      }
+    }
+  } catch (e) {}
+}
+
+async function syncAlbum(albumName) {
+  if (!quarkAllowed.value) return
+  if (!quarkMounted.value) {
+    toast.error(quarkMountError.value || '夸克挂载目录不可用')
+    return
+  }
+  try {
+    const r = await bizApi.post('/quark/sync', { album: albumName })
+    if (r.data.success) {
+      syncJobs.value = { ...syncJobs.value, [albumName]: r.data }
+      toast.success('已开始同步到夸克，本地文件会保留')
+      startPoll()
+    } else {
+      toast.error(r.data.error || r.data.detail || '同步失败')
+    }
+  } catch (e) {
+    toast.error(e.response?.data?.detail || '同步失败')
+  }
+}
+
+function syncLabel(albumName) {
+  const j = syncJobs.value[albumName]
+  if (!j) return '同步到夸克'
+  if (j.status === 'running') {
+    const t = j.total || 0
+    const d = j.done || 0
+    return t ? `同步中 ${d}/${t}` : '同步中…'
+  }
+  if (j.status === 'done') return '已同步'
+  if (j.status === 'failed') return '重试同步'
+  return '同步到夸克'
+}
+
+function startPoll() {
+  if (pollTimer) return
+  pollTimer = setInterval(async () => {
+    const running = Object.values(syncJobs.value).filter((j) => j && j.status === 'running' && j.job_id)
+    if (!running.length) {
+      clearInterval(pollTimer)
+      pollTimer = null
+      return
+    }
+    for (const j of running) {
+      try {
+        const r = await bizApi.get(`/quark/jobs/${j.job_id}`)
+        if (r.data.success) {
+          const album = r.data.album || j.album
+          syncJobs.value = { ...syncJobs.value, [album]: r.data }
+          if (r.data.status === 'done') toast.success(`《${album}》已同步到夸克`)
+          if (r.data.status === 'failed') toast.error(r.data.error || '同步失败')
+        }
+      } catch (e) {
+        const code = e.response && e.response.status
+        if (code === 404) {
+          const album = j.album
+          if (album) {
+            syncJobs.value = { ...syncJobs.value, [album]: { ...j, status: 'failed', error: '任务已丢失（可能服务重启）' } }
+          }
+          toast.error('同步任务已丢失，请重试')
+        }
+      }
+    }
+  }, 1200)
+}
+
+onMounted(() => {
+  load()
+  loadQuark()
+})
+onUnmounted(() => {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+})
 </script>
 
 <template>
@@ -114,7 +206,16 @@ onMounted(load)
               <div class="muted" style="font-size:12px">{{ al.count }} 集 · {{ fmtSize(al.total_size) }}</div>
             </div>
           </div>
-          <button class="success" @click.stop="downloadZip(al.name)">⬇ 下载 ZIP</button>
+          <div class="album-ops">
+            <button
+              v-if="quarkAllowed"
+              class="ghost"
+              :disabled="syncJobs[al.name]?.status === 'running' || !quarkMounted"
+              :title="quarkMounted ? '' : (quarkMountError || '夸克挂载不可用')"
+              @click.stop="syncAlbum(al.name)"
+            >☁ {{ syncLabel(al.name) }}</button>
+            <button class="success" @click.stop="downloadZip(al.name)">⬇ 下载 ZIP</button>
+          </div>
         </div>
         <div v-if="isExpanded(al.name)" class="file-grid">
           <div v-for="f in al.files" :key="f.path" class="file">
@@ -151,7 +252,8 @@ onMounted(load)
 .pad { padding: 18px 20px; }
 .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 .album { margin-bottom: 16px; }
-.album-hd { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.album-hd { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 12px; }
+.album-ops { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 .name { font-weight: 700; }
 .file-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
 .file { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--bg-soft); border: 1px solid var(--border); border-radius: 8px; }

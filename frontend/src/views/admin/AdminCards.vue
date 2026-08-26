@@ -15,11 +15,11 @@ const loading = ref(false)
 // 可绑定的接口清单（从接口管理拉取）
 const interfaces = ref([])
 
-const gen = reactive({ count: 1, expiry_type: 'fixed', expires_at: '', valid_days: 30, note: '', interface_names: [], inject_xm_cookie: false, download_mode: 'both', max_devices: 1, generating: false })
+const gen = reactive({ count: 1, expiry_type: 'fixed', expires_at: '', valid_days: 30, note: '', interface_names: [], inject_xm_cookie: false, download_mode: 'both', max_devices: 1, quark_sync: false, generating: false })
 const genResult = ref('')
 
 // 绑定编辑弹窗
-const bindEditor = reactive({ show: false, card: null, selected: [], download_mode: 'both', max_devices: 1, saving: false })
+const bindEditor = reactive({ show: false, card: null, selected: [], download_mode: 'both', max_devices: 1, quark_sync: false, saving: false })
 
 // 网络绑定管理弹窗
 const devMgr = reactive({ show: false, card: null, loading: false, data: null, busy: false })
@@ -64,6 +64,7 @@ async function generate() {
     if (gen.inject_xm_cookie) payload.inject_xm_cookie = true
     payload.download_mode = gen.download_mode
     payload.max_devices = md
+    payload.quark_sync = !!gen.quark_sync
     const r = await adminApi.post('/cards/generate', payload)
     if (r.data.success) {
       genResult.value = r.data.codes.join('\n')
@@ -106,6 +107,7 @@ function openBindEditor(c) {
   bindEditor.selected = [...(c.bound_interfaces || [])]
   bindEditor.download_mode = c.download_mode || 'both'
   bindEditor.max_devices = c.max_devices || 1
+  bindEditor.quark_sync = !!c.quark_sync
   bindEditor.show = true
 }
 
@@ -117,6 +119,7 @@ async function saveBinding() {
     const body = { interface_names: [...bindEditor.selected] }
     body.download_mode = bindEditor.download_mode
     body.max_devices = md
+    body.quark_sync = !!bindEditor.quark_sync
     const r = await adminApi.patch(`/cards/${bindEditor.card.id}`, body)
     if (r.data.success) {
       toast.success(bindEditor.selected.length ? '绑定已更新' : '已取消接口限制')
@@ -255,6 +258,10 @@ onMounted(() => { load(); loadInterfaces() })
           <input type="checkbox" v-model="gen.inject_xm_cookie" />
           <span>注入后端 Cookie（免前端扫码即可下官方音频）</span>
         </label>
+        <label class="bind-item">
+          <input type="checkbox" v-model="gen.quark_sync" />
+          <span>允许同步到夸克（写入你的夸克挂载盘，默认关）</span>
+        </label>
       </div>
       <div v-if="genResult" class="gen-result">
         <div class="gr-head">
@@ -281,7 +288,7 @@ onMounted(() => { load(); loadInterfaces() })
       <div v-if="loading" class="empty-state">加载中…</div>
       <table v-else class="tbl">
         <thead>
-          <tr><th>卡密</th><th>状态</th><th>类型</th><th>到期/剩余</th><th>绑定接口</th><th>下载模式</th><th>网络数</th><th>备注</th><th>最近登录</th><th>操作</th></tr>
+          <tr><th>卡密</th><th>状态</th><th>类型</th><th>到期/剩余</th><th>绑定接口</th><th>下载模式</th><th>网络数</th><th>夸克</th><th>备注</th><th>最近登录</th><th>操作</th></tr>
         </thead>
         <tbody>
           <tr v-for="c in cards" :key="c.code">
@@ -295,6 +302,7 @@ onMounted(() => { load(); loadInterfaces() })
             <td class="muted">{{ fmtBound(c) }}</td>
             <td class="muted">{{ fmtMode(c) }}</td>
             <td class="muted">{{ c.max_devices || 1 }} 个</td>
+            <td class="muted">{{ c.quark_sync ? '已开通' : '—' }}</td>
             <td class="muted">{{ c.note || '—' }}</td>
             <td class="muted">{{ fmtDate(c.last_login_at) }}</td>
             <td class="ops">
@@ -338,6 +346,10 @@ onMounted(() => { load(); loadInterfaces() })
         <label class="bind-item block">
           允许绑定的网络数（1~10，同一网络不限设备）
           <input v-model.number="bindEditor.max_devices" type="number" min="1" max="10" step="1" style="width:80px" />
+        </label>
+        <label class="bind-item block">
+          <input type="checkbox" v-model="bindEditor.quark_sync" />
+          <span>允许同步到夸克（写入你本人的夸克挂载盘）</span>
         </label>
         <div style="display:flex;gap:10px;margin-top:18px;justify-content:flex-end">
           <button class="ghost" @click="bindEditor.show=false">取消</button>

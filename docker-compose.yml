@@ -9,9 +9,12 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./data:/app/data
+      # 飞牛夸克挂载：宿主机路径 → 容器内 /app/quark（仅开通卡密可同步到此）
+      - /vol02/1000-1-92d69cac/yousheng:/app/quark
     environment:
       - TZ=Asia/Shanghai
       - DATA_DIR=/app/data
       - DOWNLOAD_DIR=/app/downloads
+      - QUARK_SYNC_DIR=/app/quark
     shm_size: "2g"
     privileged: true

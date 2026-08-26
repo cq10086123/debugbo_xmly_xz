@@ -47,6 +47,7 @@ from api.search import router as search_router
 from api.files import router as files_router
 from api.log_router import router as log_router
 from api.skills import router as skills_router
+from api.quark import router as quark_router
 from api.interfaces import router as interfaces_router, admin_router as interfaces_admin_router
 from api.extension import router as extension_router
 from api.announcements import router as announcements_router, admin_router as announcements_admin_router
@@ -215,6 +216,7 @@ app.include_router(accounts_router)
 app.include_router(search_router)
 app.include_router(download_router)
 app.include_router(files_router)
+app.include_router(quark_router)
 app.include_router(interfaces_router)
 app.include_router(extension_router)
 app.include_router(announcements_router)
