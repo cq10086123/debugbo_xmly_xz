@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from api.deps import get_current_card
+from api.deps import get_current_card, ensure_interface_allowed
 from api.search import _do_search
 from api.download import (
     start_batch_download, 
@@ -36,6 +36,7 @@ class TaskIdRequest(BaseModel):
 
 @router.post("/search_books", summary="搜索书籍", description="当用户想听某本书但不知道 album_id 时调用此接口。返回相关书籍列表与对应的 album_id。")
 async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_current_card)):
+    ensure_interface_allowed(auth, "official")
     data = await asyncio.to_thread(_do_search, req.keyword, 1)
     if data.get("ret") != 200:
         return {"success": False, "error": data.get("msg", "搜索失败")}
@@ -56,6 +57,7 @@ async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_curren
 @router.post("/get_chapters", summary="获取书籍章节概况", description="在用户要下载前，获取此书籍共有多少集。")
 async def skill_get_chapters(req: AlbumIdRequest, auth: dict = Depends(get_current_card)):
     try:
+        ensure_interface_allowed(auth, "official")
         dl = _make_downloader(download_root=_config.DOWNLOAD_DIR / auth["code"], card_id=auth["card_id"])
         result = await asyncio.to_thread(dl.get_track_list, req.album_id)
         if not result.get("success"):
@@ -116,7 +118,7 @@ async def skill_retry_task(req: TaskIdRequest, auth: dict = Depends(get_current_
     return await retry_batch_failed(req.task_id, auth=auth)
 
 @router.post("/get_card_info", summary="获取卡密状态信息", description="获取当前使用的卡密的剩余时间、有效状态等基本信息。")
-async def skill_get_card_info(auth: dict = Depends(get_current_card)):
+def skill_get_card_info(auth: dict = Depends(get_current_card)):
     from db.session import SessionLocal
     from db.models import Card
     import time
@@ -145,7 +147,7 @@ async def skill_get_card_info(auth: dict = Depends(get_current_card)):
         db.close()
 
 @router.post("/check_accounts", summary="巡检官方账号状态", description="查询当前卡密名下是否绑定了喜马拉雅账号，以及账号是否失效。")
-async def skill_check_accounts(auth: dict = Depends(get_current_card)):
+def skill_check_accounts(auth: dict = Depends(get_current_card)):
     accounts = list_accounts(auth["card_id"])
     if not accounts:
         return {
