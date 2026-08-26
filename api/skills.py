@@ -118,6 +118,36 @@ async def skill_check_task_status(req: TaskIdRequest, auth: dict = Depends(get_c
 async def skill_retry_task(req: TaskIdRequest, auth: dict = Depends(get_current_card)):
     return await retry_batch_failed(req.task_id, auth=auth)
 
+
+@router.post("/reset_stuck_local_task", summary="重置卡死的本地插件任务", description="当 check_local_tasks 发现有任务长时间卡在 running 状态进度不动，或者是由于浏览器崩溃导致的僵尸任务时，调用此接口将其重置为 pending，让插件能重新接管下载。")
+async def skill_reset_stuck_local_task(req: TaskIdRequest, auth: dict = Depends(get_current_card)):
+    from db.session import SessionLocal
+    from db.models import LocalTask
+    
+    db = SessionLocal()
+    try:
+        task = db.query(LocalTask).filter_by(task_id=req.task_id, card_id=auth["card_id"]).first()
+        if not task:
+            return {"success": False, "error": "任务不存在或不属于当前卡密"}
+            
+        if task.status != "running":
+            return {"success": False, "message": f"任务当前状态为 {task.status}，无需重置。"}
+            
+        # 强制剥夺认领权，打回排队池
+        task.status = "pending"
+        task.claim_id = None
+        task.claimed_at = None
+        db.commit()
+        return {
+            "success": True, 
+            "message": "已成功将僵尸任务打回排队池。请提示用户打开浏览器并确保插件开启，插件会在 30 秒内重新接管并继续下载。"
+        }
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "error": str(e)}
+    finally:
+        db.close()
+
 @router.post("/get_card_info", summary="获取卡密状态信息", description="获取当前使用的卡密的剩余时间、有效状态等基本信息。")
 def skill_get_card_info(auth: dict = Depends(get_current_card)):
     from db.session import SessionLocal
@@ -304,6 +334,29 @@ async def export_skills_openapi(request: Request, token: str):
                 }
             },
 
+
+            "/api/skills/reset_stuck_local_task": {
+                "post": {
+                    "summary": "重置卡死的本地插件任务",
+                    "description": "当 check_local_tasks 发现有任务长时间卡在 running 状态进度不动，或者是由于浏览器崩溃导致的僵尸任务时，调用此接口将其重置为 pending，让插件能重新接管下载。",
+                    "operationId": "skill_reset_stuck_local_task",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "task_id": {"type": "string", "description": "下载任务的唯一 task_id"}
+                                    },
+                                    "required": ["task_id"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "成功"}}
+                }
+            },
             "/api/skills/check_local_tasks": {
                 "post": {
                     "summary": "查询浏览器插件本地下载状态",
@@ -365,15 +418,27 @@ async def skill_check_local_tasks(auth: dict = Depends(get_current_card)):
         total = prog.get("total", len(t.get("tracks", [])) or 1)
         completed = prog.get("completed", 0)
         skipped = prog.get("skipped", 0)
-        failed_count = len(t.get("failed_list", []))
+
+        failed_list = t.get("failed_list", [])
+        failed_count = len(failed_list)
+        failed_details = []
+        # 最多提取前 3 个失败日志给 AI 分析，防止 token 爆炸
+        for f_item in failed_list[:3]:
+            # 兼容可能的字典结构或纯字符串
+            if isinstance(f_item, dict):
+                failed_details.append(f"集数 {f_item.get('episode_num', '未知')}: {f_item.get('error', '未知错误')}")
+            else:
+                failed_details.append(str(f_item)[:100])
         
         summary_list.append({
+
             "task_id": t.get("task_id"),
             "album_title": t.get("album_title"),
             "status": t.get("status"), # running(下载中) 或 pending(排队等待认领)
             "total_episodes": total,
             "completed": completed,
             "failed_count": failed_count,
+            "failed_details": failed_details,
             "error_msg": t.get("error", "")
         })
         
@@ -381,5 +446,5 @@ async def skill_check_local_tasks(auth: dict = Depends(get_current_card)):
         "success": True,
         "active_tasks_count": len(tasks),
         "tasks": summary_list,
-        "suggestion": "如果有任务一直处于 pending（排队）状态，请提醒用户确保他们电脑上的浏览器开着且安装了插件。如果有失败的，可以提示用户在网页端重试。"
+        "suggestion": "如有 pending 任务，提醒用户打开浏览器；如果 running 任务进度长时间卡死，可能浏览器已崩溃，建议询问用户是否调用 reset_stuck_local_task 重置；如果 failed_details 包含签名错误/403，提示扫码续期。"
     }
