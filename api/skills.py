@@ -16,6 +16,7 @@ from api.download import (
 )
 from core import config as _config
 from core.account_manager import list_accounts
+from api.extension import list_local_tasks, create_local_task, CreateTaskRequest
 
 router = APIRouter(prefix="/api/skills", tags=["AI_Skills"])
 
@@ -302,6 +303,15 @@ async def export_skills_openapi(request: Request, token: str):
                     "responses": {"200": {"description": "成功"}}
                 }
             },
+
+            "/api/skills/check_local_tasks": {
+                "post": {
+                    "summary": "查询浏览器插件本地下载状态",
+                    "description": "查询当前卡密下有哪些书籍正在通过浏览器插件（本地电脑）下载，或者在排队等待下载，以及进度和报错信息。",
+                    "operationId": "skill_check_local_tasks",
+                    "responses": {"200": {"description": "成功"}}
+                }
+            },
             "/api/skills/check_accounts": {
                 "post": {
                     "summary": "巡检官方账号状态",
@@ -335,3 +345,41 @@ async def export_skills_openapi(request: Request, token: str):
         content=openapi_schema,
         headers={"Content-Disposition": f'attachment; filename="ai_skills_config_{token[:4]}.json"'}
     )
+
+
+@router.post("/check_local_tasks", summary="查询浏览器插件本地下载状态", description="查询当前卡密下有哪些书籍正在通过浏览器插件（本地电脑）下载，或者在排队等待下载，以及进度和报错信息。")
+async def skill_check_local_tasks(auth: dict = Depends(get_current_card)):
+    # 直接复用 extension.py 里现成的轮询接口，它返回当前卡密下所有 pending 和 running 的任务
+    resp = await list_local_tasks(auth=auth)
+    if not resp.get("success"):
+        return resp
+    
+    tasks = resp.get("tasks", [])
+    if not tasks:
+        return {"success": True, "message": "目前没有本地插件下载任务在运行或排队。"}
+    
+    summary_list = []
+    for t in tasks:
+        # progress JSON 长这样: {"total": 100, "completed": 45, "skipped": 0}
+        prog = t.get("progress") or {}
+        total = prog.get("total", len(t.get("tracks", [])) or 1)
+        completed = prog.get("completed", 0)
+        skipped = prog.get("skipped", 0)
+        failed_count = len(t.get("failed_list", []))
+        
+        summary_list.append({
+            "task_id": t.get("task_id"),
+            "album_title": t.get("album_title"),
+            "status": t.get("status"), # running(下载中) 或 pending(排队等待认领)
+            "total_episodes": total,
+            "completed": completed,
+            "failed_count": failed_count,
+            "error_msg": t.get("error", "")
+        })
+        
+    return {
+        "success": True,
+        "active_tasks_count": len(tasks),
+        "tasks": summary_list,
+        "suggestion": "如果有任务一直处于 pending（排队）状态，请提醒用户确保他们电脑上的浏览器开着且安装了插件。如果有失败的，可以提示用户在网页端重试。"
+    }
