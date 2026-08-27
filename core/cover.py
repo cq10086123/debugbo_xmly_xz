@@ -33,9 +33,14 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-# 契约字段：脚本接口按 script_examples.py 的约定输出 bookImage；
-# cover 是适配器归一化后的标准名，官方适配器也用它。二者之外一律不认。
-_CONTRACT_KEYS = ("cover", "bookImage")
+# 契约字段：
+#   cover      —— 适配器归一化后的标准名（官方适配器 / 脚本适配器共用）
+#   bookImage  —— 脚本接口按 script_examples.py 约定输出的名字
+#   cover_path —— 喜马拉雅官方搜索 API 的原始键。skills 的官方搜索分支直接
+#                 消费 /revision/search 的原始 doc（不经适配器），故必须认它，
+#                 否则官方接口没有封面。见 api/search.py 与 OfficialAdapter。
+# 三者之外一律不认——字段映射是搜索脚本的职责。
+_CONTRACT_KEYS = ("cover", "bookImage", "cover_path")
 
 _IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
 

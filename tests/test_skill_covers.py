@@ -360,3 +360,92 @@ def test_normalize_book_keeps_other_fields_intact():
     assert norm["author"] == "主播" and norm["bookAnchor"] == "主播"
     assert norm["count"] == 12 and norm["trackCount"] == 12
     assert norm["intro"] == "简介"
+
+
+# ── ⑥ 封面代理的安全边界（审查阶段发现的问题） ──
+def test_official_raw_doc_cover_path_is_recognized():
+    """回归：skills 的官方搜索分支直接消费 /revision/search 原始 doc，
+    其封面键是 cover_path。若不认它，官方接口会整体失去封面。"""
+    from core.cover import extract_cover
+    doc = {"id": 123, "title": "斗破苍穹", "nickname": "甲",
+           "cover_path": "//fdfs.xmcdn.com/a.jpg", "tracks": 100}
+    assert extract_cover(doc) == "https://fdfs.xmcdn.com/a.jpg"
+
+
+def test_cover_proxy_blocks_redirect_to_internal(env, monkeypatch):
+    """回归：requests 默认跟随 302，若上游跳转到内网则绕过 SSRF 校验。
+
+    代理必须逐跳校验，拒绝跳向内网的重定向。
+    """
+    import api.skills as sk
+    from fastapi import HTTPException
+
+    class FakeResp:
+        status_code = 302
+        headers = {"Location": "http://169.254.169.254/latest/meta-data/"}
+        def close(self): pass
+
+    def fake_get(url, **kw):
+        assert kw.get("allow_redirects") is False, "必须禁用自动重定向"
+        return FakeResp()
+
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(sk.cover_mod, "is_safe_fetch_target",
+                        lambda u: "169.254" not in u)
+
+    signed = sk.cover_mod.sign("https://img.example.com/a.jpg")
+    from urllib.parse import parse_qs, urlparse
+    q = parse_qs(urlparse(signed).query)
+    with pytest.raises(HTTPException) as ei:
+        _run(sk.skill_cover_proxy(u=q["u"][0], e=q["e"][0], s=q["s"][0]))
+    assert ei.value.status_code == 400
+    assert "重定向" in str(ei.value.detail)
+
+
+def test_cover_proxy_rejects_oversized_body(env, monkeypatch):
+    """上游返回超大文件时必须截断，避免耗尽内存。"""
+    import api.skills as sk
+    from fastapi import HTTPException
+
+    class FakeResp:
+        status_code = 200
+        headers = {"Content-Type": "image/jpeg"}
+        def iter_content(self, n):
+            for _ in range(200):
+                yield b"x" * 1024 * 1024   # 累计 200MB
+        def close(self): pass
+
+    import requests
+    monkeypatch.setattr(requests, "get", lambda url, **kw: FakeResp())
+    monkeypatch.setattr(sk.cover_mod, "is_safe_fetch_target", lambda u: True)
+
+    signed = sk.cover_mod.sign("https://img.example.com/a.jpg")
+    from urllib.parse import parse_qs, urlparse
+    q = parse_qs(urlparse(signed).query)
+    with pytest.raises(HTTPException) as ei:
+        _run(sk.skill_cover_proxy(u=q["u"][0], e=q["e"][0], s=q["s"][0]))
+    assert ei.value.status_code == 502
+    assert "过大" in str(ei.value.detail)
+
+
+def test_cover_proxy_accepts_content_type_with_charset(env, monkeypatch):
+    """Content-Type 带 charset 参数时不应被误判为非图片。"""
+    import api.skills as sk
+
+    class FakeResp:
+        status_code = 200
+        headers = {"Content-Type": "image/jpeg; charset=binary"}
+        def iter_content(self, n): yield b"\xff\xd8\xff\xe0data"
+        def close(self): pass
+
+    import requests
+    monkeypatch.setattr(requests, "get", lambda url, **kw: FakeResp())
+    monkeypatch.setattr(sk.cover_mod, "is_safe_fetch_target", lambda u: True)
+
+    signed = sk.cover_mod.sign("https://img.example.com/a.jpg")
+    from urllib.parse import parse_qs, urlparse
+    q = parse_qs(urlparse(signed).query)
+    r = _run(sk.skill_cover_proxy(u=q["u"][0], e=q["e"][0], s=q["s"][0]))
+    assert r.media_type == "image/jpeg"
+    assert r.body == b"\xff\xd8\xff\xe0data"

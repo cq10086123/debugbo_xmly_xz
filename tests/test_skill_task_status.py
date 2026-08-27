@@ -220,3 +220,43 @@ def test_list_active_downloads_finds_thirdparty(env):
     ids = [t["task_id"] for t in r["tasks"]]
     assert f"tp{RUN[:6]}" in ids, f"应列出第三方进行中任务，实际: {r}"
     assert f"off{RUN[:5]}" in ids, "应列出官方进行中任务"
+
+
+# ── ⑦ 健壮性（审查阶段补充） ──
+def test_progress_percent_is_clamped():
+    """插件重复计数导致 done>total 时，百分比不得超过 100。"""
+    from api.skills import _parse_local_progress
+    assert _parse_local_progress({"total": 5, "done": 9}, [], [])["percent"] == 100
+
+
+def test_progress_handles_non_numeric_and_wrong_types():
+    from api.skills import _parse_local_progress
+    for bad in ({"total": "abc", "done": None}, [1, 2], None, "x", {"total": -5}):
+        out = _parse_local_progress(bad, [], [])
+        assert out["percent"] == 0
+        assert out["total"] >= 0 and out["completed"] >= 0
+
+
+def test_corrupt_json_does_not_hide_existing_task(env):
+    """progress 字段是脏 JSON 时，任务仍应被查到，而不是误报「任务不存在」。"""
+    import json as _json
+    from db.session import SessionLocal
+    from db.models import LocalTask
+
+    tid = f"crp{RUN[:5]}"
+    db = SessionLocal()
+    try:
+        db.add(LocalTask(
+            task_id=tid, card_id=env["card_id"], source="official",
+            album_title="脏数据书", tracks="[]", status="running",
+            progress="{不是合法json", failed_list="也不是json",
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    r = _check(tid, env)
+    assert r["success"] is True, f"脏 JSON 不应导致任务查不到: {r}"
+    assert r["album_title"] == "脏数据书"
+    assert r["status"] == "running"

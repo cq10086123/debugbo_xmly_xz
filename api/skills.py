@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import Optional
+from urllib.parse import urljoin
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -27,6 +28,15 @@ from core.account_manager import list_accounts
 from api.extension import list_local_tasks, create_local_task, CreateTaskRequest
 
 logger = logging.getLogger(__name__)
+
+# 封面代理的安全上限
+_COVER_MAX_REDIRECTS = 3
+_COVER_MAX_BYTES = 8 * 1024 * 1024  # 8MB，封面图远小于此
+
+
+class _CoverFetchError(Exception):
+    """封面抓取被安全策略拒绝（重定向越界 / 目标不被允许）。"""
+
 
 router = APIRouter(prefix="/api/skills", tags=["AI_Skills"])
 
@@ -203,28 +213,60 @@ async def skill_cover_proxy(u: str = "", e: str = "", s: str = ""):
         raise HTTPException(status_code=400, detail="封面地址不被允许")
 
     def _fetch():
+        """手动跟随重定向，并对每一跳都做 SSRF 校验。
+
+        requests 默认 allow_redirects=True，若上游用 302 指向 169.254.169.254
+        等内网地址，只校验原始 URL 会被绕过，故此处逐跳校验。
+        """
         import requests
-        return requests.get(
-            target, timeout=10, verify=False,
-            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)",
-                     # 带上 Referer 以绕过上游防盗链
-                     "Referer": "https://www.ximalaya.com/"},
-        )
+        url = target
+        headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)",
+                   # 带上 Referer 以绕过上游防盗链
+                   "Referer": "https://www.ximalaya.com/"}
+        for _ in range(_COVER_MAX_REDIRECTS):
+            resp = requests.get(url, timeout=10, verify=False, headers=headers,
+                                allow_redirects=False, stream=True)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                nxt = resp.headers.get("Location") or ""
+                resp.close()
+                if not nxt:
+                    raise _CoverFetchError("重定向缺少 Location")
+                url = urljoin(url, nxt)
+                if not cover_mod.is_safe_fetch_target(url):
+                    raise _CoverFetchError("重定向目标不被允许")
+                continue
+            return resp
+        raise _CoverFetchError("重定向次数过多")
 
     try:
         resp = await asyncio.to_thread(_fetch)
+    except _CoverFetchError as ex:
+        raise HTTPException(status_code=400, detail=str(ex))
+    except Exception as ex:  # noqa: BLE001
+        logger.warning(f"封面代理失败 {target}: {ex}")
+        raise HTTPException(status_code=502, detail="封面获取失败")
+
+    try:
         if resp.status_code != 200:
             raise HTTPException(status_code=502, detail=f"封面获取失败（{resp.status_code}）")
-        ctype = resp.headers.get("Content-Type", "image/jpeg")
+        ctype = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
         if not ctype.startswith("image/"):
             raise HTTPException(status_code=502, detail="上游返回的不是图片")
-        return Response(content=resp.content, media_type=ctype,
+        # 限制响应体大小，避免上游返回超大文件耗尽内存
+        body = b""
+        for chunk in resp.iter_content(65536):
+            body += chunk
+            if len(body) > _COVER_MAX_BYTES:
+                raise HTTPException(status_code=502, detail="封面文件过大")
+        return Response(content=body, media_type=ctype,
                         headers={"Cache-Control": "public, max-age=86400"})
     except HTTPException:
         raise
     except Exception as ex:  # noqa: BLE001
         logger.warning(f"封面代理失败 {target}: {ex}")
         raise HTTPException(status_code=502, detail="封面获取失败")
+    finally:
+        resp.close()
 
 
 @router.post("/get_chapters", summary="获取书籍章节概况", description="在用户要下载前，获取此书籍共有多少集。必须传入搜索时获得的 source 和 album_id。")
@@ -481,37 +523,74 @@ async def skill_list_active_downloads(auth: dict = Depends(get_current_card_skil
             "message": "当前没有正在进行的下载任务。"}
 
 
+def _parse_local_progress(progress, tracks, failed_list) -> dict:
+    """统一解析插件本地任务的进度。
+
+    插件心跳写入的键是 {total, done, failed}（见 extension/background.js），
+    历史数据可能是 {completed, skipped}，两者都兼容。
+    check_task_status 与 check_local_tasks 共用此函数，避免两处各写一份口径。
+    """
+    prog = progress if isinstance(progress, dict) else {}
+
+    def _int(value, default=0):
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    total = _int(prog.get("total")) or len(tracks or []) or 0
+    completed = _int(prog.get("done", prog.get("completed", 0)))
+    skipped = _int(prog.get("skipped", 0))
+    done = completed + skipped
+    # 插件偶发多报（重试重复计数）时把百分比钳在 100，避免出现 180% 这种数字
+    percent = min(100, round(done / total * 100)) if total else 0
+    return {
+        "total": total,
+        "completed": completed,
+        "skipped": skipped,
+        "percent": percent,
+        "failed_count": _int(prog.get("failed", len(failed_list or []))),
+    }
+
+
 def _local_task_summary(task_id: str, card_id: int) -> Optional[dict]:
     """从 local_tasks 表读取插件任务进度（插件心跳写入 progress={total,done,failed}）。"""
     import json as _json
     from db.session import SessionLocal
     from db.models import LocalTask
 
+    def _load(raw, fallback):
+        """脏 JSON 不能让「任务存在」变成「任务不存在」，降级为默认值即可。"""
+        if not raw:
+            return fallback
+        try:
+            return _json.loads(raw)
+        except (ValueError, TypeError):
+            logger.warning(f"本地任务 {task_id} 的字段不是合法 JSON，已降级处理")
+            return fallback
+
     db = SessionLocal()
     try:
         t = db.query(LocalTask).filter_by(task_id=task_id, card_id=card_id).first()
         if not t:
             return None
-        prog = _json.loads(t.progress) if t.progress else {}
-        tracks = _json.loads(t.tracks or "[]")
-        failed_list = _json.loads(t.failed_list) if t.failed_list else []
-        total = prog.get("total") or len(tracks)
-        # 插件写的是 done/failed；旧数据可能是 completed/skipped
-        completed = prog.get("done", prog.get("completed", 0)) or 0
-        skipped = prog.get("skipped", 0) or 0
+        failed_list = _load(t.failed_list, [])
+        if not isinstance(failed_list, list):
+            failed_list = []
+        prog = _parse_local_progress(
+            _load(t.progress, {}),
+            _load(t.tracks, []),
+            failed_list,
+        )
         return {
             "task_id": task_id,
             "source": t.source,
             "task_type": "local",
             "album_title": t.album_title or "",
             "status": t.status,
-            "total": total,
-            "completed": completed,
-            "skipped": skipped,
-            "percent": round((completed + skipped) / total * 100) if total else 0,
-            "failed_count": prog.get("failed", len(failed_list)) or 0,
             "errors": failed_list[:5],
             "error_msg": t.error or "",
+            **prog,
         }
     except Exception as e:  # noqa: BLE001
         logger.warning(f"读取本地任务 {task_id} 失败: {e}")
@@ -1100,15 +1179,13 @@ async def skill_check_local_tasks(auth: dict = Depends(get_current_card_skill)):
 
     summary_list = []
     for t in tasks:
-        prog = t.get("progress") or {}
-        total = prog.get("total") or len(t.get("tracks", [])) or 0
-        # 插件心跳写入的键是 done/failed（见 extension/background.js），
-        # 旧代码读的是 completed → 进度永远显示 0。两种键都兼容。
-        completed = prog.get("done", prog.get("completed", 0)) or 0
-        skipped = prog.get("skipped", 0) or 0
-
         failed_list = t.get("failed_list", [])
-        failed_count = prog.get("failed", len(failed_list)) or 0
+        # 与 check_task_status 共用同一套进度口径（插件写的是 done/failed）
+        prog = _parse_local_progress(t.get("progress"), t.get("tracks"), failed_list)
+        total = prog["total"]
+        completed = prog["completed"]
+        skipped = prog["skipped"]
+        failed_count = prog["failed_count"]
         failed_details = []
         for f_item in failed_list[:3]:
             if isinstance(f_item, dict):
@@ -1124,7 +1201,7 @@ async def skill_check_local_tasks(auth: dict = Depends(get_current_card_skill)):
             "total_episodes": total,
             "completed": completed,
             "skipped": skipped,
-            "percent": round((completed + skipped) / total * 100) if total else 0,
+            "percent": prog["percent"],
             "failed_count": failed_count,
             "failed_details": failed_details,
             "error_msg": t.get("error", "")
