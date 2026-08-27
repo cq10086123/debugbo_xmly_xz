@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { bizApi, adminApi, getBizToken, getAdminToken, setBizToken, setAdminToken } from '../utils/request'
+import { bizApi, adminApi, getBizToken, getAdminToken, setBizToken, setAdminToken, getSavedCardCode, setSavedCardCode } from '../utils/request'
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -21,6 +21,9 @@ export const useAuthStore = defineStore('auth', {
         this.bizToken = data.token
         this.card = data.card
         setBizToken(data.token)
+        // 记住卡密：被踢/重启浏览器后下次自动回填，避免翻历史记录
+        // 只信后端返回的 card.code（用户输入可能含前后空格/大小写差异，后端已规范化）
+        if (data.card && data.card.code) setSavedCardCode(data.card.code)
       }
       return data
     },
@@ -43,6 +46,8 @@ export const useAuthStore = defineStore('auth', {
       this.bizToken = ''
       this.card = null
       setBizToken('')
+      // 主动退出登录时清掉缓存的卡密——用户想换卡或不希望下次自动填入的场景
+      setSavedCardCode('')
     },
     async adminLogin(username, password) {
       const { data } = await adminApi.post('/login', { username, password })
