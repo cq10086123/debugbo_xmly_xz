@@ -54,6 +54,21 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
 _intf_tasks: Dict[str, dict] = {}
 
 
+def reload_intf_tasks():
+    """init_db 之后调用：从数据库恢复第三方接口任务。
+
+    第三方任务本来就会经 run_generic_batch → persist_task 落库，但启动时
+    只恢复了 official 一种引擎，导致重启后 _intf_tasks 恒为空：网页的
+    「接口任务」列表整个消失，进行中的任务也无法取消。
+    第三方 engine 存的是接口名（用户自定义、不可枚举），故反向排除 official。
+    """
+    global _intf_tasks
+    from api.persistence import load_tasks_from_db
+    _intf_tasks = load_tasks_from_db(exclude_engines={"official"})
+    if _intf_tasks:
+        logger.info(f"已恢复 {len(_intf_tasks)} 条第三方接口任务（运行中的标记为 interrupted）")
+
+
 # ── 请求模型 ──
 class InterfaceCreate(BaseModel):
     name: str
@@ -238,12 +253,26 @@ async def test_interface(name: str, req: InterfaceTest, _: bool = Depends(get_cu
     try:
         if req.keyword:
             s = adapter.search_books(req.keyword, 1)
+            rows = s.get("results", [])
             result["search"] = {
                 "success": s.get("success", False),
-                "count": len(s.get("results", [])),
+                "count": len(rows),
                 "error": s.get("error"),
-                "sample": s.get("results", [])[:3],
+                "sample": rows[:3],
             }
+            # 封面自检：确认脚本是否已把封面映射到标准字段（bookImage/cover），
+            # 避免「加完接口后网页与 AI 都显示不了封面」这类静默失败。
+            if rows:
+                from core.cover import extract_cover, describe_cover_detection
+                hit = sum(1 for r in rows if extract_cover(r))
+                cover_info = {
+                    "detected": hit,
+                    "total": len(rows),
+                    "ok": hit > 0,
+                }
+                if hit == 0:
+                    cover_info["hint"] = describe_cover_detection(rows[0])
+                result["search"]["cover"] = cover_info
         else:
             result["search"] = {"success": False, "error": "未提供 keyword"}
     except Exception as e:  # noqa: BLE001
@@ -488,6 +517,10 @@ async def intf_batch(name: str, req: BatchRequest, auth: dict = Depends(get_curr
         "started_at": time.time(), "finished_at": None, "cancelled": False,
         "fmt": req.fmt, "concurrency": req.concurrency,
     }
+    # 立即落库，与官方 batch 一致：否则服务器在下载途中崩溃时，该任务从未被
+    # 持久化过，重启后彻底消失（用户看到的是「下载中的书不翼而飞」）。
+    from api.persistence import persist_task
+    persist_task(_intf_tasks[task_id])
     asyncio.create_task(run_generic_batch(
         adapter, _intf_tasks[task_id], card_id, req.book_id, req.start_episode,
         req.end_episode or 999999, req.fmt, req.concurrency, download_root,
@@ -548,6 +581,18 @@ async def cancel_intf_task(task_id: str, auth: dict = Depends(get_current_card))
     if not task or task.get("card_id") != auth["card_id"]:
         return {"success": False, "error": "任务不存在"}
     task["cancelled"] = True
+    if task.get("status") == "interrupted":
+        # 重启恢复的任务：进程内已无协程会把 cancelling 收敛为 cancelled，
+        # 若照常置为 cancelling 会永久卡住（既不推进也不允许删除）。直接终结。
+        task["status"] = "cancelled"
+        task["finished_at"] = time.time()
+        try:
+            download_slot.release(task.get("card_id"), task_id)
+        except Exception:
+            logger.exception("取消时释放下载槽失败")
+        from api.persistence import persist_task
+        persist_task(task)
+        return {"success": True, "message": "已取消"}
     task["status"] = "cancelling"
     # 立即释放全局下载槽（同官方批量取消语义：取消后即可开始下一本）
     try:
@@ -565,4 +610,21 @@ async def delete_intf_task(task_id: str, auth: dict = Depends(get_current_card))
     if task.get("status") in ("running", "cancelling"):
         return {"success": False, "error": "运行中的任务无法删除，请先取消并等待其停止"}
     del _intf_tasks[task_id]
+    # 物理删除数据库行：第三方任务经 run_generic_batch 落库，只删内存的话
+    # 下次重启会被 reload_intf_tasks 重新加载回来（幽灵复活）。
+    # 与官方 delete_batch_task 的语义保持一致。
+    from db.session import SessionLocal
+    from db.models import DownloadTask
+    db = SessionLocal()
+    try:
+        db.query(DownloadTask).filter_by(task_id=task_id).delete()
+        db.commit()
+    except Exception:
+        logger.exception(f"删除第三方任务 {task_id} 的数据库行失败")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
     return {"success": True, "message": "已删除"}

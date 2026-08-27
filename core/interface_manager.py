@@ -30,10 +30,12 @@ TYPE_SCRIPT = "script"
 VALID_TYPES = (TYPE_OFFICIAL, TYPE_SCRIPT)
 
 
+from core.cover import extract_cover, normalize_cover_url
+
+
 def _fix_cover(url: str) -> str:
-    if url and url.startswith("//"):
-        return "https:" + url
-    return url
+    """协议补全（保留原名供既有调用点使用）。实现统一收敛到 core.cover。"""
+    return normalize_cover_url(url)
 
 
 # ════════════════════════════════════════════
@@ -195,8 +197,26 @@ class ScriptAdapter(BaseInterfaceAdapter):
         self._audio_iface = ScriptInterface(audio_src, "audio", self.timeout,
                                             extra_modules=self.allowed_modules) if audio_src else None
         # 自定义字段透传：搜索结果 / 章节结果按 id 缓存，供后续阶段读取（与 py 一致）
+        # 注意：适配器是全局单例，此缓存被所有用户共享，故只累积不整体清空，
+        # 仅在超出上限时按插入顺序淘汰最旧的条目。
         self._search_cache: Dict[str, Dict] = {}
         self._chapter_cache: Dict[tuple, Dict] = {}
+
+    _SEARCH_CACHE_MAX = 2000
+    _CHAPTER_CACHE_MAX = 20000
+
+    def _trim_search_cache(self):
+        """超出上限时淘汰最旧条目（dict 保持插入顺序）。"""
+        over = len(self._search_cache) - self._SEARCH_CACHE_MAX
+        if over > 0:
+            for k in list(self._search_cache)[:over]:
+                self._search_cache.pop(k, None)
+
+    def _trim_chapter_cache(self):
+        over = len(self._chapter_cache) - self._CHAPTER_CACHE_MAX
+        if over > 0:
+            for k in list(self._chapter_cache)[:over]:
+                self._chapter_cache.pop(k, None)
 
     def shutdown(self):
         """释放三个阶段的常驻 worker 池（接口被替换/删除时由管理器调用，防子进程泄漏）"""
@@ -260,7 +280,11 @@ class ScriptAdapter(BaseInterfaceAdapter):
         book_id = str(item.get("id", ""))
         title = item.get("bookTitle", "") or item.get("title", "")
         author = item.get("bookAnchor", "") or item.get("author", "")
-        cover = item.get("bookImage", "") or item.get("cover", "")
+        # 封面统一走通用提取器：不再只认 bookImage/cover 两个键，
+        # 而是覆盖 pic/img/thumbnail/picture 等常见命名、嵌套结构，
+        # 并顺带做协议补全（//x.com/a.jpg → https://x.com/a.jpg）。
+        # 这样网页端 <img :src="item.cover"> 与 AI 封面功能共用同一套结果。
+        cover = extract_cover(item)
         count = item.get("count", item.get("trackCount", item.get("total", 0)))
         try:
             count = int(count)
@@ -318,7 +342,9 @@ class ScriptAdapter(BaseInterfaceAdapter):
         try:
             params = self._build_search_params(keyword.strip(), page)
             raw = self._search_iface.execute(params)
-            self._search_cache.clear()
+            # 不再整体 clear：适配器是全局单例，多个用户共用同一份缓存。
+            # 清空会把别人刚搜到、正准备下载的书挤掉，导致其 album_title 取不到
+            # （落盘目录退化、书与书互相覆盖）。改为累积 + 上限淘汰。
             results = []
             for item in raw:
                 if not isinstance(item, dict):
@@ -326,6 +352,7 @@ class ScriptAdapter(BaseInterfaceAdapter):
                 bid = str(item.get("id", ""))
                 self._search_cache[bid] = item
                 results.append(self._normalize_book(item))
+            self._trim_search_cache()
             return {"success": True, "results": results, "total": len(results)}
         except Exception as e:
             logger.exception(f"[{self.name}] script search error: {e}")
@@ -340,7 +367,11 @@ class ScriptAdapter(BaseInterfaceAdapter):
                 book_id, 1, 2000, search_item.get("count"), search_item
             )
             raw = self._chapters_iface.execute(params)
-            self._chapter_cache.clear()
+            # 同 _search_cache：全局共享，不能整体 clear，否则别人正在下载的书
+            # 会在中途丢失章节自定义字段（audio 脚本靠它取播放地址）。
+            # 只清掉当前这本书自己的旧条目，再重填。
+            for k in [k for k in self._chapter_cache if k[0] == str(book_id)]:
+                self._chapter_cache.pop(k, None)
             tracks = []
             for item in raw:
                 if not isinstance(item, dict):
@@ -348,6 +379,7 @@ class ScriptAdapter(BaseInterfaceAdapter):
                 cid = str(item.get("chapter_id", ""))
                 self._chapter_cache[(str(book_id), cid)] = item
                 tracks.append(self._normalize_chapter(item))
+            self._trim_chapter_cache()
             return {
                 "success": True,
                 "album_title": (search_item.get("bookTitle") or "") if search_item else "",

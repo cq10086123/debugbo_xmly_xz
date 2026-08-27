@@ -528,6 +528,17 @@ onMounted(load)
               <span v-if="testResult[sec].count !== undefined">命中 {{ testResult[sec].count }} 条</span>
               <span v-if="testResult[sec].album_title"> · 书名：{{ testResult[sec].album_title }}</span>
               <span v-if="testResult[sec].url"> · {{ testResult[sec].url }}</span>
+              <div v-if="testResult[sec].cover" class="cover-check"
+                   :class="testResult[sec].cover.ok ? 'cover-ok' : 'cover-warn'">
+                <template v-if="testResult[sec].cover.ok">
+                  ✅ 封面已读取（{{ testResult[sec].cover.detected }}/{{ testResult[sec].cover.total }} 条），
+                  网页与 AI 均可显示封面
+                </template>
+                <template v-else>
+                  ⚠️ 未读取到封面 —— 网页搜索页与 AI 都将没有封面图。
+                  <div class="cover-hint">{{ testResult[sec].cover.hint }}</div>
+                </template>
+              </div>
               <ul v-if="testResult[sec].sample && testResult[sec].sample.length">
                 <li v-for="(s, i) in testResult[sec].sample" :key="i">{{ JSON.stringify(s) }}</li>
               </ul>
@@ -540,6 +551,10 @@ onMounted(load)
 </template>
 
 <style scoped>
+.cover-check { margin: 8px 0; padding: 8px 10px; border-radius: 6px; font-size: 13px; line-height: 1.5; }
+.cover-ok { background: rgba(34, 197, 94, .12); color: #16a34a; }
+.cover-warn { background: rgba(234, 179, 8, .12); color: #b45309; }
+.cover-hint { margin-top: 4px; opacity: .9; word-break: break-all; }
 .pad { padding: 20px; }
 .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 16px; }
 .head .success { flex-shrink: 0; }

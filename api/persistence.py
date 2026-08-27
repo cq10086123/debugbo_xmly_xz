@@ -45,7 +45,12 @@ def persist_task(task: dict):
             db.add(row)
         row.card_id = task.get("card_id")
         row.engine = task.get("engine", "official")
-        row.album_id = str(task.get("album_id")) if task.get("album_id") is not None else None
+        # 第三方接口任务的字典里只有 book_id（见 interfaces.intf_batch），没有 album_id。
+        # 不兜底的话 album_id 落库为 NULL，重启恢复后书籍标识丢失。
+        _album_id = task.get("album_id")
+        if _album_id is None:
+            _album_id = task.get("book_id")
+        row.album_id = str(_album_id) if _album_id is not None else None
         album_title = task.get("album_title", "")
         row.album_title = album_title or None
         row.start_episode = task.get("start_episode", 1) or 1
@@ -113,15 +118,75 @@ def persist_record(card_id, task_id, album_id, album_title, track_id,
         db.close()
 
 
-def load_tasks_from_db(engine: str) -> dict:
+def get_task_row(task_id: str, card_id: Optional[int] = None) -> Optional[dict]:
+    """只读查询单个任务行（任意 engine），不修改任何状态。
+
+    与 load_tasks_from_db 的区别：后者是「启动恢复」语义，会把 running 改写成
+    interrupted；查询进度这类读路径绝不能有副作用，故单列此函数。
+
+    card_id 传入时做归属校验（跨卡查询一律视为不存在）。
+    """
+    if not task_id:
+        return None
+    db = SessionLocal()
+    try:
+        row = db.query(DownloadTask).filter_by(task_id=task_id).first()
+        if row is None:
+            return None
+        if card_id is not None and row.card_id != card_id:
+            return None
+        failed_list = json.loads(row.failed_list) if row.failed_list else []
+        total = row.total or 0
+        done = (row.completed or 0) + (row.skipped_count or 0)
+        return {
+            "task_id": row.task_id,
+            "card_id": row.card_id,
+            "engine": row.engine or "official",
+            "interface_name": row.engine or "official",
+            "album_id": row.album_id,
+            "album_title": row.album_title or "",
+            "status": row.status or "",
+            "total": total,
+            "current": row.current or 0,
+            "current_title": row.current_title or "",
+            "completed": row.completed or 0,
+            "skipped_count": row.skipped_count or 0,
+            "failed_list": failed_list,
+            "failed_count": len(failed_list),
+            "error": row.error or "",
+            "percent": round(done / total * 100) if total > 0 else 0,
+            "fmt": row.fmt or "mp3",
+            "started_at": _ts(row.created_at),
+            "finished_at": _ts(row.finished_at),
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"get_task_row({task_id}) 失败：{e}")
+        return None
+    finally:
+        db.close()
+
+
+def load_tasks_from_db(engine: str = "official", *, exclude_engines=None) -> dict:
     """启动时从数据库恢复任务，将 running/cancelling 标记为 interrupted
+
+    engine         —— 精确匹配某个引擎（官方为 "official"）。
+    exclude_engines—— 反向选择：取「不属于这些引擎」的全部任务。第三方接口的
+                      engine 存的是接口名（用户自定义、数量不定），无法枚举，
+                      故用 exclude_engines={"official"} 一次性捞出所有第三方任务。
+                      两个参数互斥，传了 exclude_engines 时 engine 被忽略。
 
     若表尚未创建（首次导入时 init_db 还未运行），安全返回空字典。
     """
     result: dict = {}
     db = SessionLocal()
     try:
-        rows = db.query(DownloadTask).filter_by(engine=engine).all()
+        if exclude_engines:
+            q = db.query(DownloadTask).filter(
+                DownloadTask.engine.notin_(list(exclude_engines))
+            )
+            rows = q.all()
+        else:
+            rows = db.query(DownloadTask).filter_by(engine=engine).all()
         # 预加载 卡密ID -> 卡号，用于重建 per-card 下载目录（restart 后任务字典需含 download_root）
         card_codes = {c.id: c.code for c in db.query(Card).all()}
         for row in rows:
@@ -167,6 +232,11 @@ def load_tasks_from_db(engine: str) -> dict:
                 "download_root": str(_config.DOWNLOAD_DIR / card_codes.get(row.card_id, "")),
                 "engine": row.engine or "official",
                 "interface_name": row.engine or "official",
+                # 第三方接口任务（_intf_tasks）额外依赖的字段，见 interfaces._task_summary。
+                # 官方任务多带这几个键无副作用（_batch_tasks 的读取方按需取值）。
+                "interface": row.engine or "official",
+                "book_id": row.album_id or "",
+                "last_error": "",
             }
     except Exception as e:
         # 表不存在等异常：安全返回空（init_db 尚未运行）
