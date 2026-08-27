@@ -176,7 +176,9 @@ class DownloadTask(Base):
     id = mapped_column(Integer, primary_key=True)
     task_id = mapped_column(String(16), unique=True, nullable=False, index=True)
     card_id = mapped_column(Integer, ForeignKey("cards.id"), nullable=False, index=True)
-    engine = mapped_column(String(16), default="official", nullable=False)  # official/thirdparty
+    # official | 第三方接口 name（interfaces.name 为 String(64)，此处须对齐，
+    # 否则超过 16 字符的接口名在非 SQLite 后端会被截断，导致任务归属错乱）
+    engine = mapped_column(String(64), default="official", nullable=False)
     album_id = mapped_column(Text, nullable=True)
     album_title = mapped_column(Text, nullable=True)
     start_episode = mapped_column(Integer, default=1, nullable=False)

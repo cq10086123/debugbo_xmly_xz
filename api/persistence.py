@@ -45,7 +45,12 @@ def persist_task(task: dict):
             db.add(row)
         row.card_id = task.get("card_id")
         row.engine = task.get("engine", "official")
-        row.album_id = str(task.get("album_id")) if task.get("album_id") is not None else None
+        # 第三方接口任务的字典里只有 book_id（见 interfaces.intf_batch），没有 album_id。
+        # 不兜底的话 album_id 落库为 NULL，重启恢复后书籍标识丢失。
+        _album_id = task.get("album_id")
+        if _album_id is None:
+            _album_id = task.get("book_id")
+        row.album_id = str(_album_id) if _album_id is not None else None
         album_title = task.get("album_title", "")
         row.album_title = album_title or None
         row.start_episode = task.get("start_episode", 1) or 1

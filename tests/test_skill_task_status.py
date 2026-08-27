@@ -343,3 +343,77 @@ def test_restored_third_party_task_still_card_scoped(env):
     other = dict(env, card_id=env["card_id"] + 9999)
     assert _run(I.get_intf_task(tid, auth=other))["success"] is False
     assert _run(I.list_intf_tasks(auth=other))["tasks"] == []
+
+
+# ── ⑨ 恢复机制的细节缺陷（细致审查阶段发现） ──
+def _real_intf_task(task_id, card_id, engine="某小说站", status="running"):
+    """完全照抄 interfaces.intf_batch 构造的真实字典 —— 注意它没有 album_id。"""
+    import time
+    return {
+        "task_id": task_id, "card_id": card_id, "interface": engine,
+        "download_root": "/tmp", "engine": engine, "book_id": "BK12345",
+        "start_episode": 1, "end_episode": None, "status": status,
+        "album_title": "测试书", "total": 100, "current": 30, "current_title": "",
+        "completed": 30, "skipped_count": 0, "completed_files": [], "failed_list": [],
+        "error": "", "last_error": "", "started_at": time.time(),
+        "finished_at": None, "cancelled": False, "fmt": "mp3", "concurrency": 3,
+    }
+
+
+def test_third_party_book_id_survives_restart(env):
+    """第三方任务字典只有 book_id 没有 album_id，persist_task 必须兜底，
+    否则重启后书籍标识丢失（TaskCard 显示「专辑 #undefined」）。"""
+    from api.persistence import persist_task
+    import api.interfaces as I
+
+    tid = f"bk{RUN[:6]}"
+    persist_task(_real_intf_task(tid, env["card_id"]))
+    I.reload_intf_tasks()
+    assert I._intf_tasks[tid]["book_id"] == "BK12345"
+
+
+def test_cancel_interrupted_task_does_not_wedge(env):
+    """重启恢复的 interrupted 任务被取消时，进程内已无协程会把 cancelling
+    收敛为 cancelled → 会永久卡在 cancelling，既不推进也删不掉。"""
+    from api.persistence import persist_task
+    import api.interfaces as I
+
+    tid = f"wg{RUN[:6]}"
+    persist_task(_real_intf_task(tid, env["card_id"]))
+    I.reload_intf_tasks()
+    assert I._intf_tasks[tid]["status"] == "interrupted"
+
+    r = _run(I.cancel_intf_task(tid, auth=env))
+    assert r["success"] is True
+    assert I._intf_tasks[tid]["status"] == "cancelled", "中断任务取消后必须立即终结"
+    assert _run(I.delete_intf_task(tid, auth=env))["success"] is True
+
+
+def test_cancel_running_task_keeps_two_phase_semantics(env):
+    """对照：真正在跑的任务，取消仍须走 cancelling 让协程自己收尾。"""
+    import api.interfaces as I
+
+    tid = f"lv{RUN[:6]}"
+    I._intf_tasks[tid] = _real_intf_task(tid, env["card_id"], status="running")
+    r = _run(I.cancel_intf_task(tid, auth=env))
+    assert r["success"] is True
+    assert I._intf_tasks[tid]["status"] == "cancelling"
+    assert _run(I.delete_intf_task(tid, auth=env))["success"] is False
+
+
+def test_long_interface_name_roundtrips(env):
+    """接口名 String(64)，download_tasks.engine 必须对齐，否则超长名会被截断，
+    反向查询（notin_ official）与任务归属都会错乱。"""
+    from db.models import DownloadTask
+    from api.persistence import persist_task
+    import api.interfaces as I
+
+    long_name = "my-novel-site-backup-v2"
+    assert len(long_name) > 16
+    tid = f"ln{RUN[:6]}"
+    persist_task(_real_intf_task(tid, env["card_id"], engine=long_name))
+
+    assert DownloadTask.__table__.c.engine.type.length >= 64
+    I.reload_intf_tasks()
+    assert tid in I._intf_tasks
+    assert I._intf_tasks[tid]["engine"] == long_name

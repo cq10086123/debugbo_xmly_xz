@@ -577,6 +577,18 @@ async def cancel_intf_task(task_id: str, auth: dict = Depends(get_current_card))
     if not task or task.get("card_id") != auth["card_id"]:
         return {"success": False, "error": "任务不存在"}
     task["cancelled"] = True
+    if task.get("status") == "interrupted":
+        # 重启恢复的任务：进程内已无协程会把 cancelling 收敛为 cancelled，
+        # 若照常置为 cancelling 会永久卡住（既不推进也不允许删除）。直接终结。
+        task["status"] = "cancelled"
+        task["finished_at"] = time.time()
+        try:
+            download_slot.release(task.get("card_id"), task_id)
+        except Exception:
+            logger.exception("取消时释放下载槽失败")
+        from api.persistence import persist_task
+        persist_task(task)
+        return {"success": True, "message": "已取消"}
     task["status"] = "cancelling"
     # 立即释放全局下载槽（同官方批量取消语义：取消后即可开始下一本）
     try:
