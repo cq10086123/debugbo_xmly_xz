@@ -1,0 +1,200 @@
+"""书籍封面：接口无关的通用提取 + 签名代理。
+
+核心契约：**新增第三方接口无需改任何代码，封面功能自动生效**。
+因此测试重点是「任意字段命名的搜索结果都能挖出封面」，
+而不是针对某个具体接口断言。
+
+运行：python -m pytest tests/test_skill_covers.py -v
+"""
+import asyncio
+import time
+import uuid
+from datetime import datetime, timezone
+
+import pytest
+
+RUN = uuid.uuid4().hex[:8]
+
+
+@pytest.fixture(scope="module")
+def env():
+    from db.init_db import init_db
+    from db.session import SessionLocal
+    from db.models import Card
+    from api.card_helpers import issue_skill_token
+
+    init_db()
+    db = SessionLocal()
+    try:
+        card = Card(
+            code=f"CV-{RUN}", status="used", expiry_type="fixed",
+            expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+            skill_token=issue_skill_token(),
+        )
+        db.add(card)
+        db.commit()
+        db.refresh(card)
+        auth = {"card_id": card.id, "code": card.code, "token": card.skill_token,
+                "bound": [], "download_mode": "both", "quark_sync": False}
+    finally:
+        db.close()
+    return auth
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+# ── ① 通用提取：覆盖各种字段命名（含未来新接口） ──
+@pytest.mark.parametrize("payload,expected", [
+    ({"cover": "//fdfs.xmcdn.com/a.jpg"}, "https://fdfs.xmcdn.com/a.jpg"),
+    ({"cover_path": "https://x.com/p.jpg"}, "https://x.com/p.jpg"),
+    ({"bookImage": "https://x.com/b.png"}, "https://x.com/b.png"),
+    ({"pic": "https://x.com/c.webp"}, "https://x.com/c.webp"),
+    ({"imgUrl": "https://x.com/d.jpg"}, "https://x.com/d.jpg"),
+    ({"thumbnail": "//x.com/e.jpg"}, "https://x.com/e.jpg"),
+    ({"albumCover": "https://x.com/f.jpeg"}, "https://x.com/f.jpeg"),
+    ({"poster": "https://x.com/g.jpg"}, "https://x.com/g.jpg"),
+    # 嵌套结构（itingshu 风格）
+    ({"novel": {"cover": "https://x.com/h.jpg"}}, "https://x.com/h.jpg"),
+    ({"data": {"info": {"pic": "https://x.com/i.jpg"}}}, "https://x.com/i.jpg"),
+    # 完全没见过的键名，但含 cover/img 语义且值像图片 → 兜底命中
+    ({"my_weird_cover_field": "https://x.com/j.jpg"}, "https://x.com/j.jpg"),
+    ({"custom_img_src": "https://x.com/k.jpg"}, "https://x.com/k.jpg"),
+    # 无封面 / 脏数据
+    ({"title": "无图"}, ""),
+    ({"cover": ""}, ""),
+    ({"cover": "not-a-url"}, ""),
+    ({"cover": None}, ""),
+    ({}, ""),
+])
+def test_extract_cover_is_interface_agnostic(payload, expected):
+    from core.cover import extract_cover
+    assert extract_cover(payload) == expected
+
+
+def test_extract_cover_survives_bad_input():
+    from core.cover import extract_cover
+    for bad in (None, "string", 123, [], set()):
+        assert extract_cover(bad) == ""
+
+
+# ── ② 签名与校验 ──
+def test_sign_verify_roundtrip():
+    from core import cover as c
+    url = "https://img.example.com/a.jpg?x=1&y=2"
+    signed = c.sign(url)
+    assert signed.startswith("/api/skills/cover?")
+    from urllib.parse import parse_qs, urlparse
+    q = parse_qs(urlparse(signed).query)
+    assert c.verify(q["u"][0], q["e"][0], q["s"][0]) == url
+
+
+def test_verify_rejects_tampering_and_expiry():
+    from core import cover as c
+    from urllib.parse import parse_qs, urlparse
+    q = parse_qs(urlparse(c.sign("https://img.example.com/a.jpg")).query)
+    u, e, s = q["u"][0], q["e"][0], q["s"][0]
+    # 改 URL 但沿用旧签名 → 拒绝（防止被当成任意 URL 代理）
+    from core.cover import _b64e
+    assert c.verify(_b64e("https://evil.com/x.jpg"), e, s) is None
+    # 改签名 → 拒绝
+    assert c.verify(u, e, "deadbeef" * 4) is None
+    # 过期 → 拒绝
+    expired = str(int(time.time()) - 10)
+    assert c.verify(u, expired, c._sign(u, int(expired))) is None
+
+
+def test_ssrf_guard_blocks_internal_targets():
+    from core.cover import is_safe_fetch_target
+    for bad in ("http://127.0.0.1/a.jpg", "http://localhost/a.jpg",
+                "http://192.168.1.1/a.jpg", "http://169.254.169.254/latest/meta-data",
+                "file:///etc/passwd", "ftp://x.com/a.jpg", "http://[::1]/a.jpg"):
+        assert is_safe_fetch_target(bad) is False, f"应拦截: {bad}"
+
+
+def test_cover_proxy_rejects_bad_signature(env):
+    from api.skills import skill_cover_proxy
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei:
+        _run(skill_cover_proxy(u="aaa", e="99999999999", s="bad"))
+    assert ei.value.status_code == 403
+
+
+# ── ③ 端到端：搜索 → show_covers（模拟任意第三方接口） ──
+def _fake_search(monkeypatch, docs):
+    """把任意形状的第三方接口返回塞进 intf_search，验证无需改代码即可支持。"""
+    async def fake(name, keyword, page=1, auth=None):
+        return {"success": True, "results": docs}
+    import api.interfaces as intf
+    monkeypatch.setattr(intf, "intf_search", fake)
+
+
+def test_search_then_show_covers_for_new_interface(env, monkeypatch):
+    """模拟一个「以后才添加」的接口，字段命名完全不同，仍应支持封面。"""
+    from api.skills import skill_search_books, skill_show_covers, SearchRequest, ShowCoversRequest
+
+    _fake_search(monkeypatch, [
+        {"id": "1", "title": "斗破苍穹", "author": "A", "picture": "https://x.com/1.jpg"},
+        {"id": "2", "title": "斗破苍穹", "author": "B", "picture": "https://x.com/2.jpg"},
+        {"id": "3", "title": "斗破苍穹", "author": "C"},  # 无封面
+    ])
+    r = _run(skill_search_books(SearchRequest(keyword="斗破苍穹", source="brand_new_api"), auth=env))
+    assert r["success"] is True
+    assert [x["has_cover"] for x in r["results"]] == [True, True, False]
+    assert [x["index"] for x in r["results"]] == [1, 2, 3]
+    # 内部字段不应泄漏给 AI
+    assert all("_cover" not in x for x in r["results"])
+
+    # 「前三本封面」
+    r2 = _run(skill_show_covers(ShowCoversRequest(count=3), auth=env))
+    assert r2["success"] is True
+    assert len(r2["covers"]) == 2
+    assert len(r2["missing"]) == 1
+    assert all(c["image_url"].startswith("/api/skills/cover?") for c in r2["covers"])
+
+    # 「第 2 本的封面」
+    r3 = _run(skill_show_covers(ShowCoversRequest(index=2), auth=env))
+    assert r3["success"] is True
+    assert len(r3["covers"]) == 1
+    assert r3["covers"][0]["index"] == 2
+    assert r3["covers"][0]["album_id"] == "2"
+
+
+def test_show_covers_index_out_of_range(env, monkeypatch):
+    from api.skills import skill_search_books, skill_show_covers, SearchRequest, ShowCoversRequest
+    _fake_search(monkeypatch, [{"id": "1", "title": "书", "cover": "https://x.com/1.jpg"}])
+    _run(skill_search_books(SearchRequest(keyword="书", source="s"), auth=env))
+    r = _run(skill_show_covers(ShowCoversRequest(index=9), auth=env))
+    assert r["success"] is False
+    assert "超出范围" in r["error"]
+
+
+def test_show_covers_without_search(env):
+    from api.skills import skill_show_covers, ShowCoversRequest
+    import api.skills as sk
+    sk._last_search.pop(env["card_id"], None)
+    r = _run(skill_show_covers(ShowCoversRequest(count=1), auth=env))
+    assert r["success"] is False
+    assert "search_books" in r["suggestion"]
+
+
+def test_cover_cache_is_per_card(env, monkeypatch):
+    """A 卡的搜索结果不得被 B 卡看到。"""
+    from api.skills import skill_search_books, skill_show_covers, SearchRequest, ShowCoversRequest
+    _fake_search(monkeypatch, [{"id": "1", "title": "私密书", "cover": "https://x.com/1.jpg"}])
+    _run(skill_search_books(SearchRequest(keyword="x", source="s"), auth=env))
+
+    other = dict(env, card_id=env["card_id"] + 99999)
+    r = _run(skill_show_covers(ShowCoversRequest(count=1), auth=other))
+    assert r["success"] is False, "不得跨卡密读到他人搜索结果"
+
+
+def test_search_without_covers_has_no_suggestion(env, monkeypatch):
+    """一本都没封面时不应误导 AI 去调 show_covers。"""
+    from api.skills import skill_search_books, SearchRequest
+    _fake_search(monkeypatch, [{"id": "1", "title": "无图书"}])
+    r = _run(skill_search_books(SearchRequest(keyword="x", source="s"), auth=env))
+    assert r["success"] is True
+    assert all(not x["has_cover"] for x in r["results"])
+    assert "suggestion" not in r

@@ -21,6 +21,8 @@ from api.download import (
     _batch_tasks
 )
 from core import config as _config
+from core import cover as cover_mod
+from core.cover import extract_cover
 from core.account_manager import list_accounts
 from api.extension import list_local_tasks, create_local_task, CreateTaskRequest
 
@@ -46,6 +48,10 @@ class DownloadSubmitRequest(BaseModel):
 class TaskIdRequest(BaseModel):
     task_id: str = Field(..., description="下载任务的唯一 task_id")
 
+class ShowCoversRequest(BaseModel):
+    count: int = Field(3, description="要显示前几本书的封面。例如用户说「看第一本的封面」传 1，「前三本」传 3。不传默认 3。")
+    index: Optional[int] = Field(None, description="只看某一本时传它的序号（从 1 开始）。例如「第 2 本的封面」传 2。传了 index 时忽略 count。")
+
 class BookNameRequest(BaseModel):
     book_name: str = Field(..., description="已下载书籍的名称（专辑目录名，支持模糊匹配）")
 
@@ -58,7 +64,7 @@ async def skill_get_sources(auth: dict = Depends(get_current_card_skill)):
     from api.interfaces import public_interface_list
     return await public_interface_list(auth)
 
-@router.post("/search_books", summary="搜索书籍", description="当用户想听某本书但不知道 album_id 时调用此接口。可以指定 source（默认 official）。返回相关书籍列表与对应的 album_id。")
+@router.post("/search_books", summary="搜索书籍", description="当用户想听某本书但不知道 album_id 时调用此接口。可以指定 source（默认 official）。返回相关书籍列表与对应的 album_id。返回中的 has_cover 表示该书有封面图可看；若用户想通过封面辨认是哪一本（书名重复时很常见），再调用 show_covers 显示图片。")
 async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_current_card_skill)):
     if req.source == "official":
         ensure_interface_allowed(auth, "official")
@@ -77,9 +83,10 @@ async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_curren
                 "author": doc.get("nickname"),
                 "intro": doc.get("intro", "")[:100],
                 "tracks_count": doc.get("tracks"),
-                "is_finished": doc.get("isFinished") == 2
+                "is_finished": doc.get("isFinished") == 2,
+                "_cover": extract_cover(doc),
             })
-        return {"success": True, "results": simplified}
+        return _with_cover_meta(simplified, auth["card_id"], req.keyword, "official")
     else:
         from api.interfaces import intf_search
         resp = await intf_search(req.source, req.keyword, 1, auth=auth)
@@ -95,9 +102,128 @@ async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_curren
                 "title": doc.get("title"),
                 "author": doc.get("author"),
                 "intro": doc.get("intro", "")[:100],
-                "tracks_count": doc.get("trackCount", doc.get("tracks", doc.get("count", "未知")))
+                "tracks_count": doc.get("trackCount", doc.get("tracks", doc.get("count", "未知"))),
+                # 通用提取：不依赖具体接口的字段命名，新接口自动生效
+                "_cover": extract_cover(doc),
             })
-        return {"success": True, "results": simplified}
+        return _with_cover_meta(simplified, auth["card_id"], req.keyword, req.source)
+
+
+# 最近一次搜索结果的封面缓存：card_id -> {keyword, source, items:[{title, cover}]}
+# 只存封面 URL 与书名，供后续「显示第 N 本封面」按序号取用，无需重新搜索。
+_last_search: dict[int, dict] = {}
+_LAST_SEARCH_MAX_CARDS = 500
+
+
+def _with_cover_meta(items: list[dict], card_id: int, keyword: str, source: str) -> dict:
+    """把内部 _cover 字段转成对 AI 友好的 has_cover 标记，并缓存供 show_covers 使用。"""
+    if len(_last_search) > _LAST_SEARCH_MAX_CARDS:
+        _last_search.clear()
+    _last_search[card_id] = {
+        "keyword": keyword,
+        "source": source,
+        "items": [{"title": it.get("title"), "album_id": it.get("album_id"),
+                   "cover": it.get("_cover", "")} for it in items],
+    }
+    results = []
+    for idx, it in enumerate(items, start=1):
+        row = {k: v for k, v in it.items() if k != "_cover"}
+        row["index"] = idx
+        row["has_cover"] = bool(it.get("_cover"))
+        results.append(row)
+
+    with_cover = sum(1 for r in results if r["has_cover"])
+    out = {"success": True, "results": results}
+    if with_cover:
+        out["suggestion"] = (
+            f"共 {len(results)} 条结果，其中 {with_cover} 条有封面。"
+            "若书名重复、用户难以分辨是哪一本，可以主动提示「需要我把封面显示出来吗」；"
+            "用户确认后调用 show_covers（count=前几本，或 index=指定第几本）。"
+        )
+    return out
+
+
+@router.post("/show_covers", summary="显示搜索结果的书籍封面", description="在 search_books 之后调用，把结果里的书籍封面作为图片显示给用户。书名重复时用来辨认是哪一本。用户说「显示第一本的封面」传 index=1；说「前三本封面」传 count=3。适用于所有音源接口。")
+async def skill_show_covers(req: ShowCoversRequest = ShowCoversRequest(), auth: dict = Depends(get_current_card_skill)):
+    cached = _last_search.get(auth["card_id"])
+    if not cached or not cached.get("items"):
+        return {"success": False, "error": "还没有搜索记录",
+                "suggestion": "请先调用 search_books 搜索书籍，然后再显示封面。"}
+
+    items = cached["items"]
+    if req.index is not None:
+        if req.index < 1 or req.index > len(items):
+            return {"success": False,
+                    "error": f"序号 {req.index} 超出范围，本次搜索共 {len(items)} 条结果。"}
+        chosen = [(req.index, items[req.index - 1])]
+    else:
+        count = max(1, min(int(req.count or 3), len(items)))
+        chosen = list(enumerate(items[:count], start=1))
+
+    covers, missing = [], []
+    for idx, it in chosen:
+        if it.get("cover"):
+            covers.append({
+                "index": idx,
+                "title": it.get("title"),
+                "album_id": it.get("album_id"),
+                # 签名代理 URL：AI 渲染器无凭证也能取图，且绕开上游防盗链
+                "image_url": cover_mod.sign(it["cover"]),
+            })
+        else:
+            missing.append({"index": idx, "title": it.get("title")})
+
+    if not covers:
+        return {"success": False, "error": "所选书籍均无封面图",
+                "missing": missing,
+                "suggestion": "该音源未提供封面，请改用书名、主播与集数帮用户区分。"}
+
+    return {
+        "success": True,
+        "keyword": cached.get("keyword"),
+        "source": cached.get("source"),
+        "covers": covers,
+        "missing": missing,
+        "suggestion": (
+            "请用 Markdown 图片语法把每本书的封面显示出来，例如 "
+            "![书名](image_url)，并在图片旁标注序号与书名，方便用户指认要下载哪一本。"
+        ),
+    }
+
+
+@router.get("/cover", summary="封面图片代理（签名访问）", description="由 show_covers 返回的签名 URL 指向此处，供 AI 客户端直接加载图片，无需鉴权头。")
+async def skill_cover_proxy(u: str = "", e: str = "", s: str = ""):
+    from fastapi.responses import Response
+
+    target = cover_mod.verify(u, e, s)
+    if not target:
+        raise HTTPException(status_code=403, detail="封面链接无效或已过期")
+    if not cover_mod.is_safe_fetch_target(target):
+        raise HTTPException(status_code=400, detail="封面地址不被允许")
+
+    def _fetch():
+        import requests
+        return requests.get(
+            target, timeout=10, verify=False,
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)",
+                     # 带上 Referer 以绕过上游防盗链
+                     "Referer": "https://www.ximalaya.com/"},
+        )
+
+    try:
+        resp = await asyncio.to_thread(_fetch)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"封面获取失败（{resp.status_code}）")
+        ctype = resp.headers.get("Content-Type", "image/jpeg")
+        if not ctype.startswith("image/"):
+            raise HTTPException(status_code=502, detail="上游返回的不是图片")
+        return Response(content=resp.content, media_type=ctype,
+                        headers={"Cache-Control": "public, max-age=86400"})
+    except HTTPException:
+        raise
+    except Exception as ex:  # noqa: BLE001
+        logger.warning(f"封面代理失败 {target}: {ex}")
+        raise HTTPException(status_code=502, detail="封面获取失败")
 
 
 @router.post("/get_chapters", summary="获取书籍章节概况", description="在用户要下载前，获取此书籍共有多少集。必须传入搜索时获得的 source 和 album_id。")
@@ -578,10 +704,32 @@ async def export_skills_openapi(request: Request, auth: dict = Depends(get_curre
                     "responses": {"200": {"description": "成功"}}
                 }
             },
+            "/api/skills/show_covers": {
+                "post": {
+                    "summary": "显示搜索结果的书籍封面",
+                    "description": "在 search_books 之后调用，把结果里的书籍封面作为图片显示给用户，用于在书名重复时辨认是哪一本。用户说「显示第一本的封面」传 index=1；说「前三本封面」传 count=3。返回的 image_url 请用 Markdown 图片语法 ![书名](image_url) 渲染出来。适用于所有音源接口。",
+                    "operationId": "skill_show_covers",
+                    "requestBody": {
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "count": {"type": "integer", "default": 3, "description": "显示前几本书的封面，默认 3"},
+                                        "index": {"type": "integer", "description": "只看第几本（从 1 开始）；传了则忽略 count"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "成功"}}
+                }
+            },
             "/api/skills/search_books": {
                 "post": {
                     "summary": "搜索书籍",
-                    "description": "当用户想听某本书但不知道 album_id 时调用此接口。返回相关书籍列表与对应的 album_id。",
+                    "description": "当用户想听某本书但不知道 album_id 时调用此接口。返回相关书籍列表与对应的 album_id。返回中的 has_cover 表示该书有封面可看；若书名重复导致用户难以分辨，可提示用户并调用 show_covers 显示封面图片。",
                     "operationId": "skill_search_books",
                     "requestBody": {
                         "required": True,
