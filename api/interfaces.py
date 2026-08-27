@@ -517,6 +517,10 @@ async def intf_batch(name: str, req: BatchRequest, auth: dict = Depends(get_curr
         "started_at": time.time(), "finished_at": None, "cancelled": False,
         "fmt": req.fmt, "concurrency": req.concurrency,
     }
+    # 立即落库，与官方 batch 一致：否则服务器在下载途中崩溃时，该任务从未被
+    # 持久化过，重启后彻底消失（用户看到的是「下载中的书不翼而飞」）。
+    from api.persistence import persist_task
+    persist_task(_intf_tasks[task_id])
     asyncio.create_task(run_generic_batch(
         adapter, _intf_tasks[task_id], card_id, req.book_id, req.start_episode,
         req.end_episode or 999999, req.fmt, req.concurrency, download_root,

@@ -145,7 +145,14 @@ async def run_generic_batch(
         task["album_title"] = album_title
         task["total"] = end - start + 1
 
-        existing_files = await asyncio.to_thread(_scan_local, album_title, download_root)
+        # 落盘目录名：album_title 可能为空（脚本接口的书名来自搜索缓存，
+        # 直接用 book_id 下载、或缓存被其它搜索挤掉时就取不到）。
+        # 此时若仍用空目录名，所有书都会挤在卡密根目录下写成「第N集.mp3」，
+        # 导致不同书互相覆盖，且后一本会被整本误判为「已存在」而全部跳过。
+        # 用 book_id 兜底，保证每本书各有独立目录。
+        folder_name = album_title or f"book_{book_id}"
+
+        existing_files = await asyncio.to_thread(_scan_local, folder_name, download_root)
         task["skipped_count"] = 0
         download_queue = [(i, tracks[i]) for i in range(start - 1, end)]
 
@@ -164,7 +171,7 @@ async def run_generic_batch(
                 task["skipped_count"] += 1
                 task["current"] = max(task.get("current", 0), i + 1)
                 task["current_title"] = f"{title} （已存在，跳过）"
-                _, skip_path = _episode_target_path(album_title, f"第{episode_num}集", fmt, download_root)
+                _, skip_path = _episode_target_path(folder_name, f"第{episode_num}集", fmt, download_root)
                 try:
                     if skip_path.exists() and skip_path.stat().st_size > 0:
                         task["completed_files"].append({
@@ -179,7 +186,7 @@ async def run_generic_batch(
                     await broadcast()
                 return
 
-            lock_key = track_lock.make_key(card_id, album_title or str(book_id), episode_num)
+            lock_key = track_lock.make_key(card_id, folder_name, episode_num)
             if not track_lock.try_acquire(lock_key):
                 task["skipped_count"] += 1
                 task["current"] = max(task.get("current", 0), i + 1)
@@ -196,7 +203,7 @@ async def run_generic_batch(
                         await broadcast()
 
                     file_name = f"第{episode_num}集"
-                    _, target_path = _episode_target_path(album_title, file_name, fmt, download_root)
+                    _, target_path = _episode_target_path(folder_name, file_name, fmt, download_root)
                     if target_path.exists() and target_path.stat().st_size > 0:
                         existing_files.add(ep_name)
                         task["completed"] += 1
@@ -232,7 +239,7 @@ async def run_generic_batch(
                             continue
                         try:
                             file_path, file_size = await asyncio.to_thread(
-                                _download_file, audio_url, file_name, album_title, fmt, download_root
+                                _download_file, audio_url, file_name, folder_name, fmt, download_root
                             )
                             existing_files.add(ep_name)
                             existing_files.add(safe_title)
@@ -263,6 +270,13 @@ async def run_generic_batch(
                         })
             finally:
                 track_lock.release(lock_key)
+                # 进度检查点：每集结束后落库。否则任务只在「启动失败」和「全部结束」
+                # 两个时刻写库，服务器在下载途中崩溃就会丢掉全部进度。
+                # 放在 finally 里保证取消/异常路径同样留下痕迹。
+                try:
+                    persist_task(task)
+                except Exception:  # noqa: BLE001
+                    logger.warning(f"任务 {task.get('task_id')} 进度落库失败", exc_info=True)
 
         coros = [_download_one(i, track) for i, track in download_queue]
         await asyncio.gather(*coros)
