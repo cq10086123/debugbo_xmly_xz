@@ -258,3 +258,52 @@ def test_admin_test_endpoint_warns_on_blind_spot(monkeypatch):
     cov = r["result"]["search"]["cover"]
     assert cov["ok"] is False
     assert "bg" in cov["hint"]
+
+
+# ── ⑤ 归一化层：后台添加接口的统一收口点 ──
+@pytest.mark.parametrize("field", [
+    "cover", "bookImage", "pic", "picture", "img", "imgUrl",
+    "thumbnail", "albumCover", "poster", "my_cover_x",
+])
+def test_normalize_book_unifies_any_cover_field(field):
+    """后台添加的脚本接口无论用什么字段名，归一化后都应产出 cover。
+
+    这是网页端 <img :src="item.cover"> 与 AI 封面功能共同依赖的收口点。
+    修复前这里只认 bookImage/cover 两个键，其余命名网页端也显示不出封面。
+    """
+    from core.interface_manager import ScriptAdapter
+    norm = ScriptAdapter._normalize_book(
+        {"id": "1", "bookTitle": "书", field: "https://x.com/a.jpg"})
+    assert norm["cover"] == "https://x.com/a.jpg", f"字段 {field} 未被归一化"
+    # bookImage 是前端/批处理的别名，应与 cover 保持一致
+    assert norm["bookImage"] == norm["cover"]
+
+
+def test_normalize_book_fixes_protocol_relative_url():
+    """//x.com/a.jpg 必须补成 https:，否则前端 img 加载失败。"""
+    from core.interface_manager import ScriptAdapter
+    norm = ScriptAdapter._normalize_book(
+        {"id": "1", "bookTitle": "书", "cover": "//x.com/a.jpg"})
+    assert norm["cover"] == "https://x.com/a.jpg"
+
+
+def test_normalize_book_rejects_garbage_cover():
+    from core.interface_manager import ScriptAdapter
+    for junk in ("not-a-url", "", None, 123):
+        norm = ScriptAdapter._normalize_book(
+            {"id": "1", "bookTitle": "书", "cover": junk})
+        assert norm["cover"] == ""
+
+
+def test_normalize_book_keeps_other_fields_intact():
+    """封面改动不得影响 id/title/author/count 等既有归一化行为。"""
+    from core.interface_manager import ScriptAdapter
+    norm = ScriptAdapter._normalize_book({
+        "id": 7, "bookTitle": "书名", "bookAnchor": "主播",
+        "count": "12", "bookDesc": "简介", "albumId": "custom",
+    })
+    assert norm["albumId"] == "7" and norm["id"] == "7"
+    assert norm["title"] == "书名" and norm["bookTitle"] == "书名"
+    assert norm["author"] == "主播" and norm["bookAnchor"] == "主播"
+    assert norm["count"] == 12 and norm["trackCount"] == 12
+    assert norm["intro"] == "简介"

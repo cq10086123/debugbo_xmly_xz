@@ -30,10 +30,12 @@ TYPE_SCRIPT = "script"
 VALID_TYPES = (TYPE_OFFICIAL, TYPE_SCRIPT)
 
 
+from core.cover import extract_cover, normalize_cover_url
+
+
 def _fix_cover(url: str) -> str:
-    if url and url.startswith("//"):
-        return "https:" + url
-    return url
+    """协议补全（保留原名供既有调用点使用）。实现统一收敛到 core.cover。"""
+    return normalize_cover_url(url)
 
 
 # ════════════════════════════════════════════
@@ -260,7 +262,11 @@ class ScriptAdapter(BaseInterfaceAdapter):
         book_id = str(item.get("id", ""))
         title = item.get("bookTitle", "") or item.get("title", "")
         author = item.get("bookAnchor", "") or item.get("author", "")
-        cover = item.get("bookImage", "") or item.get("cover", "")
+        # 封面统一走通用提取器：不再只认 bookImage/cover 两个键，
+        # 而是覆盖 pic/img/thumbnail/picture 等常见命名、嵌套结构，
+        # 并顺带做协议补全（//x.com/a.jpg → https://x.com/a.jpg）。
+        # 这样网页端 <img :src="item.cover"> 与 AI 封面功能共用同一套结果。
+        cover = extract_cover(item)
         count = item.get("count", item.get("trackCount", item.get("total", 0)))
         try:
             count = int(count)

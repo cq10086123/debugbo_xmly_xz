@@ -103,8 +103,9 @@ async def skill_search_books(req: SearchRequest, auth: dict = Depends(get_curren
                 "author": doc.get("author"),
                 "intro": doc.get("intro", "")[:100],
                 "tracks_count": doc.get("trackCount", doc.get("tracks", doc.get("count", "未知"))),
-                # 通用提取：不依赖具体接口的字段命名，新接口自动生效
-                "_cover": extract_cover(doc),
+                # 适配器的 _normalize_book 已用通用提取器统一产出 cover；
+                # 这里只做兜底（万一某适配器未经归一化直接返回原始结构）。
+                "_cover": doc.get("cover") or extract_cover(doc),
             })
         return _with_cover_meta(simplified, auth["card_id"], req.keyword, req.source)
 
