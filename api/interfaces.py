@@ -54,6 +54,21 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9_]+$")
 _intf_tasks: Dict[str, dict] = {}
 
 
+def reload_intf_tasks():
+    """init_db 之后调用：从数据库恢复第三方接口任务。
+
+    第三方任务本来就会经 run_generic_batch → persist_task 落库，但启动时
+    只恢复了 official 一种引擎，导致重启后 _intf_tasks 恒为空：网页的
+    「接口任务」列表整个消失，进行中的任务也无法取消。
+    第三方 engine 存的是接口名（用户自定义、不可枚举），故反向排除 official。
+    """
+    global _intf_tasks
+    from api.persistence import load_tasks_from_db
+    _intf_tasks = load_tasks_from_db(exclude_engines={"official"})
+    if _intf_tasks:
+        logger.info(f"已恢复 {len(_intf_tasks)} 条第三方接口任务（运行中的标记为 interrupted）")
+
+
 # ── 请求模型 ──
 class InterfaceCreate(BaseModel):
     name: str
@@ -579,4 +594,21 @@ async def delete_intf_task(task_id: str, auth: dict = Depends(get_current_card))
     if task.get("status") in ("running", "cancelling"):
         return {"success": False, "error": "运行中的任务无法删除，请先取消并等待其停止"}
     del _intf_tasks[task_id]
+    # 物理删除数据库行：第三方任务经 run_generic_batch 落库，只删内存的话
+    # 下次重启会被 reload_intf_tasks 重新加载回来（幽灵复活）。
+    # 与官方 delete_batch_task 的语义保持一致。
+    from db.session import SessionLocal
+    from db.models import DownloadTask
+    db = SessionLocal()
+    try:
+        db.query(DownloadTask).filter_by(task_id=task_id).delete()
+        db.commit()
+    except Exception:
+        logger.exception(f"删除第三方任务 {task_id} 的数据库行失败")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
     return {"success": True, "message": "已删除"}

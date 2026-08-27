@@ -260,3 +260,86 @@ def test_corrupt_json_does_not_hide_existing_task(env):
     assert r["success"] is True, f"脏 JSON 不应导致任务查不到: {r}"
     assert r["album_title"] == "脏数据书"
     assert r["status"] == "running"
+
+
+# ── ⑧ 重启后第三方任务持久化恢复 ──
+def _persist_intf(task_id, card_id, engine, status, completed=0):
+    import time
+    from api.persistence import persist_task
+    persist_task({
+        "task_id": task_id, "card_id": card_id, "interface": engine, "engine": engine,
+        "book_id": "bk9", "album_id": "bk9", "album_title": f"{engine}的书",
+        "status": status, "total": 100, "completed": completed, "skipped_count": 0,
+        "failed_list": [], "started_at": time.time(), "fmt": "mp3", "concurrency": 3,
+    })
+
+
+def test_restart_restores_third_party_tasks(env):
+    """回归：重启后 _intf_tasks 恒为空，网页「接口任务」整个列表消失。"""
+    import api.interfaces as I
+
+    tid = f"ri{RUN[:6]}"
+    _persist_intf(tid, env["card_id"], "某小说站", "running", 42)
+    I.reload_intf_tasks()
+
+    assert tid in I._intf_tasks, "重启后第三方任务未恢复"
+    # 进程内协程已消亡，running 必须降级为 interrupted，不能继续谎报「下载中」
+    assert I._intf_tasks[tid]["status"] == "interrupted"
+
+    d = _run(I.get_intf_task(tid, auth=env))
+    assert d["success"] is True
+    assert d["interface"] == "某小说站"      # 恢复的字典要能喂饱 _task_summary
+    assert d["percent"] == 42
+
+
+def test_restart_does_not_mix_official_and_third_party(env):
+    """两张内存表必须互不污染：官方任务不得进 _intf_tasks，反之亦然。"""
+    import api.download as D
+    import api.interfaces as I
+
+    off, intf = f"ro{RUN[:6]}", f"rt{RUN[:6]}"
+    _persist_intf(off, env["card_id"], "official", "running")
+    _persist_intf(intf, env["card_id"], "第三方源", "running")
+
+    D.reload_tasks()
+    I.reload_intf_tasks()
+
+    assert off in D._batch_tasks and off not in I._intf_tasks
+    assert intf in I._intf_tasks and intf not in D._batch_tasks
+
+
+def test_deleted_third_party_task_does_not_resurrect(env):
+    """删除第三方任务必须同时删 DB 行，否则重启后「幽灵复活」。"""
+    from db.session import SessionLocal
+    from db.models import DownloadTask
+    import api.interfaces as I
+
+    tid = f"rg{RUN[:6]}"
+    _persist_intf(tid, env["card_id"], "某小说站", "completed", 100)
+    I.reload_intf_tasks()
+    assert tid in I._intf_tasks
+
+    r = _run(I.delete_intf_task(tid, auth=env))
+    assert r["success"] is True
+
+    db = SessionLocal()
+    try:
+        assert db.query(DownloadTask).filter_by(task_id=tid).first() is None
+    finally:
+        db.close()
+
+    I.reload_intf_tasks()
+    assert tid not in I._intf_tasks, "已删除的任务在重启后复活了"
+
+
+def test_restored_third_party_task_still_card_scoped(env):
+    """恢复的任务同样不能跨卡密泄露。"""
+    import api.interfaces as I
+
+    tid = f"rs{RUN[:6]}"
+    _persist_intf(tid, env["card_id"], "某小说站", "running", 5)
+    I.reload_intf_tasks()
+
+    other = dict(env, card_id=env["card_id"] + 9999)
+    assert _run(I.get_intf_task(tid, auth=other))["success"] is False
+    assert _run(I.list_intf_tasks(auth=other))["tasks"] == []

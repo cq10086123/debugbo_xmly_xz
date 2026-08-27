@@ -48,7 +48,11 @@ from api.files import router as files_router
 from api.log_router import router as log_router
 from api.skills import router as skills_router
 from api.quark import router as quark_router
-from api.interfaces import router as interfaces_router, admin_router as interfaces_admin_router
+from api.interfaces import (
+    router as interfaces_router,
+    admin_router as interfaces_admin_router,
+    reload_intf_tasks as _reload_intf,
+)
 from api.extension import router as extension_router
 from api.announcements import router as announcements_router, admin_router as announcements_admin_router
 
@@ -141,6 +145,8 @@ async def lifespan(app: FastAPI):
     iface_manager.reload_all()
     # 建表后重新加载上次运行的任务（标记 interrupted）
     _reload_off()
+    # 同上，但恢复的是第三方接口任务（_intf_tasks）
+    _reload_intf()
     # 恢复重启前中断的「失败自动重试」循环
     _resume_off()
     # 启动卡密过期清理后台任务

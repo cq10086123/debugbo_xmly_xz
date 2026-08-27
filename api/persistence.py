@@ -161,15 +161,27 @@ def get_task_row(task_id: str, card_id: Optional[int] = None) -> Optional[dict]:
         db.close()
 
 
-def load_tasks_from_db(engine: str) -> dict:
+def load_tasks_from_db(engine: str = "official", *, exclude_engines=None) -> dict:
     """启动时从数据库恢复任务，将 running/cancelling 标记为 interrupted
+
+    engine         —— 精确匹配某个引擎（官方为 "official"）。
+    exclude_engines—— 反向选择：取「不属于这些引擎」的全部任务。第三方接口的
+                      engine 存的是接口名（用户自定义、数量不定），无法枚举，
+                      故用 exclude_engines={"official"} 一次性捞出所有第三方任务。
+                      两个参数互斥，传了 exclude_engines 时 engine 被忽略。
 
     若表尚未创建（首次导入时 init_db 还未运行），安全返回空字典。
     """
     result: dict = {}
     db = SessionLocal()
     try:
-        rows = db.query(DownloadTask).filter_by(engine=engine).all()
+        if exclude_engines:
+            q = db.query(DownloadTask).filter(
+                DownloadTask.engine.notin_(list(exclude_engines))
+            )
+            rows = q.all()
+        else:
+            rows = db.query(DownloadTask).filter_by(engine=engine).all()
         # 预加载 卡密ID -> 卡号，用于重建 per-card 下载目录（restart 后任务字典需含 download_root）
         card_codes = {c.id: c.code for c in db.query(Card).all()}
         for row in rows:
@@ -215,6 +227,11 @@ def load_tasks_from_db(engine: str) -> dict:
                 "download_root": str(_config.DOWNLOAD_DIR / card_codes.get(row.card_id, "")),
                 "engine": row.engine or "official",
                 "interface_name": row.engine or "official",
+                # 第三方接口任务（_intf_tasks）额外依赖的字段，见 interfaces._task_summary。
+                # 官方任务多带这几个键无副作用（_batch_tasks 的读取方按需取值）。
+                "interface": row.engine or "official",
+                "book_id": row.album_id or "",
+                "last_error": "",
             }
     except Exception as e:
         # 表不存在等异常：安全返回空（init_db 尚未运行）
