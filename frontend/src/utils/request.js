@@ -2,6 +2,8 @@ import axios from 'axios'
 
 // 业务 token（卡密登录）
 const BIZ_KEY = 'auth_token'
+// 最近一次登录成功的卡密（明文回填，避免被踢后还要翻历史记录；主动退出时清）
+const SAVED_CARD_KEY = 'saved_card_code'
 // 管理 token（管理员登录）
 const ADMIN_KEY = 'admin_token'
 // 管理后台地址段（与后端 api_config.admin_path 对应，默认 admin）
@@ -13,6 +15,15 @@ export function getBizToken() {
 export function setBizToken(t) {
   if (t) localStorage.setItem(BIZ_KEY, t)
   else localStorage.removeItem(BIZ_KEY)
+}
+// 最近一次成功登录的卡密——登录页自动回填；主动退出登录时清；被服务端踢下线时不清
+// （被踢=临时网络/换公网 IP 等，下次回到本机仍可重登；卡密真废了由登录接口直接拒绝并清缓存）
+export function getSavedCardCode() {
+  return localStorage.getItem(SAVED_CARD_KEY) || ''
+}
+export function setSavedCardCode(code) {
+  if (code) localStorage.setItem(SAVED_CARD_KEY, code)
+  else localStorage.removeItem(SAVED_CARD_KEY)
 }
 export function getAdminToken() {
   return localStorage.getItem(ADMIN_KEY) || ''
