@@ -198,3 +198,63 @@ def test_search_without_covers_has_no_suggestion(env, monkeypatch):
     assert r["success"] is True
     assert all(not x["has_cover"] for x in r["results"])
     assert "suggestion" not in r
+
+
+# ── ④ 后台添加接口时的封面自检（防止静默失败） ──
+def test_describe_names_the_offending_field():
+    """字段名无语义时，自检必须点名具体字段并给出可复制的修法。"""
+    from core.cover import describe_cover_detection
+    msg = describe_cover_detection({"id": "1", "bookTitle": "书", "bg": "https://x.com/a.jpg"})
+    assert "bg" in msg
+    assert "book['cover']" in msg
+
+
+def test_describe_when_no_image_at_all():
+    from core.cover import describe_cover_detection
+    msg = describe_cover_detection({"id": "1", "bookTitle": "书"})
+    assert "没有发现任何图片 URL 字段" in msg
+
+
+def test_describe_handles_non_dict():
+    from core.cover import describe_cover_detection
+    assert "无法提取封面" in describe_cover_detection("not-a-dict")
+
+
+def test_admin_test_endpoint_reports_cover_status(monkeypatch):
+    """后台「测试接口」必须显式报告封面识别情况。"""
+    from api.interfaces import test_interface, InterfaceTest
+    import api.interfaces as intf
+
+    class FakeAdapter:
+        def search_books(self, kw, page=1):
+            return {"success": True, "results": [
+                {"id": "1", "title": "书", "cover": "https://x.com/a.jpg"},
+                {"id": "2", "title": "书2"},
+            ]}
+        def get_chapters(self, b): return {"success": True, "tracks": []}
+        def get_audio_url(self, b, c): return ""
+
+    monkeypatch.setattr(intf.manager, "get_adapter_any", lambda n: FakeAdapter())
+    r = _run(test_interface("x", InterfaceTest(keyword="书"), _=True))
+    cov = r["result"]["search"]["cover"]
+    assert cov["ok"] is True
+    assert cov["detected"] == 1 and cov["total"] == 2
+
+
+def test_admin_test_endpoint_warns_on_blind_spot(monkeypatch):
+    """字段名无语义 → 后台必须给出警告与修改建议，而不是静默通过。"""
+    from api.interfaces import test_interface, InterfaceTest
+    import api.interfaces as intf
+
+    class BlindAdapter:
+        def search_books(self, kw, page=1):
+            return {"success": True, "results": [
+                {"id": "1", "title": "书", "bg": "https://x.com/a.jpg"}]}
+        def get_chapters(self, b): return {"success": True, "tracks": []}
+        def get_audio_url(self, b, c): return ""
+
+    monkeypatch.setattr(intf.manager, "get_adapter_any", lambda n: BlindAdapter())
+    r = _run(test_interface("x", InterfaceTest(keyword="书"), _=True))
+    cov = r["result"]["search"]["cover"]
+    assert cov["ok"] is False
+    assert "bg" in cov["hint"]

@@ -100,6 +100,29 @@ def extract_cover(item: Any, _depth: int = 0) -> str:
     return ""
 
 
+def describe_cover_detection(item: Any) -> str:
+    """封面没被识别时，给管理员一句可执行的说明（后台「测试接口」用）。
+
+    会扫描该条结果里所有「看起来像图片 URL」的字段，直接点名建议改成 cover。
+    """
+    if not isinstance(item, dict):
+        return "搜索结果不是标准字典结构，无法提取封面。"
+    candidates = [k for k, v in item.items()
+                  if isinstance(k, str) and normalize_cover_url(v) and _looks_like_image(v)]
+    if candidates:
+        return (
+            f"该接口返回了疑似图片字段 {candidates}，但字段名不含 "
+            "cover/image/img/pic/thumb 等可识别语义，因此未被自动识别。"
+            f"请在搜索脚本里把它改名或补一份为 cover，例如："
+            f"book['cover'] = item.get('{candidates[0]}')"
+        )
+    return (
+        "该接口的搜索结果里没有发现任何图片 URL 字段。"
+        "若上游确实提供封面，请在搜索脚本中取出并以 cover 为键返回："
+        "book['cover'] = item.get('你的字段名')"
+    )
+
+
 # ════════════════════════════════════════
 #  签名图片代理
 # ════════════════════════════════════════

@@ -32,6 +32,14 @@ SEARCH_SCRIPT = '''# ═══════════════════�
 #   bookTitle - 书籍标题 ★必须★
 # 可选：bookImage(封面) / bookAnchor(主播) / count(集数) / bookDesc(简介) 等
 #
+# 【封面字段】★建议★：封面请用 bookImage 或 cover 作为键名，
+#   这样 AI 助手就能按用户要求显示书籍封面（书名重复时用来辨认是哪一本）。
+#   系统会自动识别常见命名（cover/bookImage/pic/img/thumbnail/picture… 及
+#   任何含 cover/image/img/pic/thumb 语义的键名），无需额外配置；
+#   但如果上游字段名毫无语义（如 'bg' / 'showUrl' / 中文键名），
+#   请在脚本里显式转成 cover：book['cover'] = item.get('你的字段名')。
+#   保存后可在后台「测试」接口，结果里会明确显示封面是否被识别。
+#
 # 【自定义字段传递】★重要★：搜索结果里的任何字段都会透传给【章节脚本】，
 #   例如 book['albumId'] = item.get('albumId')，章节里用 params.get('albumId') 读取。
 # ═══════════════════════════════════════════════════════════════════════════

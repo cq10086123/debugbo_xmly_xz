@@ -238,12 +238,26 @@ async def test_interface(name: str, req: InterfaceTest, _: bool = Depends(get_cu
     try:
         if req.keyword:
             s = adapter.search_books(req.keyword, 1)
+            rows = s.get("results", [])
             result["search"] = {
                 "success": s.get("success", False),
-                "count": len(s.get("results", [])),
+                "count": len(rows),
                 "error": s.get("error"),
-                "sample": s.get("results", [])[:3],
+                "sample": rows[:3],
             }
+            # 封面自检：明确告诉管理员本接口的封面能否被通用提取器识别，
+            # 避免「加完接口后 AI 显示不了封面」这类静默失败。
+            if rows:
+                from core.cover import extract_cover, describe_cover_detection
+                hit = sum(1 for r in rows if extract_cover(r))
+                cover_info = {
+                    "detected": hit,
+                    "total": len(rows),
+                    "ok": hit > 0,
+                }
+                if hit == 0:
+                    cover_info["hint"] = describe_cover_detection(rows[0])
+                result["search"]["cover"] = cover_info
         else:
             result["search"] = {"success": False, "error": "未提供 keyword"}
     except Exception as e:  # noqa: BLE001
