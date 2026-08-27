@@ -45,32 +45,54 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# ── ① 通用提取：覆盖各种字段命名（含未来新接口） ──
+# ── ① 只读契约字段：字段映射是搜索脚本的职责，运行时绝不猜 ──
 @pytest.mark.parametrize("payload,expected", [
+    # 契约字段（script_examples.py 约定 bookImage；cover 为归一化标准名）
     ({"cover": "//fdfs.xmcdn.com/a.jpg"}, "https://fdfs.xmcdn.com/a.jpg"),
-    ({"cover_path": "https://x.com/p.jpg"}, "https://x.com/p.jpg"),
     ({"bookImage": "https://x.com/b.png"}, "https://x.com/b.png"),
-    ({"pic": "https://x.com/c.webp"}, "https://x.com/c.webp"),
-    ({"imgUrl": "https://x.com/d.jpg"}, "https://x.com/d.jpg"),
-    ({"thumbnail": "//x.com/e.jpg"}, "https://x.com/e.jpg"),
-    ({"albumCover": "https://x.com/f.jpeg"}, "https://x.com/f.jpeg"),
-    ({"poster": "https://x.com/g.jpg"}, "https://x.com/g.jpg"),
-    # 嵌套结构（itingshu 风格）
-    ({"novel": {"cover": "https://x.com/h.jpg"}}, "https://x.com/h.jpg"),
-    ({"data": {"info": {"pic": "https://x.com/i.jpg"}}}, "https://x.com/i.jpg"),
-    # 完全没见过的键名，但含 cover/img 语义且值像图片 → 兜底命中
-    ({"my_weird_cover_field": "https://x.com/j.jpg"}, "https://x.com/j.jpg"),
-    ({"custom_img_src": "https://x.com/k.jpg"}, "https://x.com/k.jpg"),
+    ({"cover": "", "bookImage": "https://x.com/b.png"}, "https://x.com/b.png"),
+    ({"cover": "data:image/png;base64,iVBORw0KG"}, "data:image/png;base64,iVBORw0KG"),
+    # 非契约字段一律不认 —— 由脚本负责映射
+    ({"pic": "https://x.com/c.webp"}, ""),
+    ({"imgUrl": "https://x.com/d.jpg"}, ""),
+    ({"thumbnail": "//x.com/e.jpg"}, ""),
+    ({"albumCover": "https://x.com/f.jpeg"}, ""),
+    ({"novel": {"cover": "https://x.com/h.jpg"}}, ""),
     # 无封面 / 脏数据
     ({"title": "无图"}, ""),
     ({"cover": ""}, ""),
     ({"cover": "not-a-url"}, ""),
+    ({"cover": "暂无封面"}, ""),
     ({"cover": None}, ""),
+    ({"cover": 12345}, ""),
     ({}, ""),
 ])
-def test_extract_cover_is_interface_agnostic(payload, expected):
+def test_extract_cover_reads_contract_fields_only(payload, expected):
     from core.cover import extract_cover
     assert extract_cover(payload) == expected
+
+
+@pytest.mark.parametrize("noise_key", [
+    "avatar", "bookAnchorAvatar", "logo", "site_logo",
+    "qrcode_img", "shareImage", "icon", "banner_img",
+])
+def test_extract_cover_never_mistakes_non_cover_images(noise_key):
+    """回归：贪心匹配曾把主播头像/站点 logo/二维码/分享图当封面显示。
+
+    用户正是靠封面区分同名书籍，给错图比不给图更糟。
+    """
+    from core.cover import extract_cover
+    item = {"id": "1", "bookTitle": "书", noise_key: "https://x.com/noise.jpg"}
+    assert extract_cover(item) == "", f"{noise_key} 不应被当作封面"
+
+
+def test_contract_field_wins_over_noise():
+    """同时存在契约字段与噪声图片时，必须取契约字段。"""
+    from core.cover import extract_cover
+    item = {"id": "1", "bookTitle": "书",
+            "avatar": "https://x.com/头像.jpg",
+            "bookImage": "https://x.com/封面.jpg"}
+    assert extract_cover(item) == "https://x.com/封面.jpg"
 
 
 def test_extract_cover_survives_bad_input():
@@ -131,12 +153,16 @@ def _fake_search(monkeypatch, docs):
 
 
 def test_search_then_show_covers_for_new_interface(env, monkeypatch):
-    """模拟一个「以后才添加」的接口，字段命名完全不同，仍应支持封面。"""
+    """模拟「以后才添加」的接口：脚本按契约映射到 cover 后，全链路可用。
+
+    适配器归一化后对外就是 cover（见 _normalize_book），
+    这里直接以归一化结果作为 intf_search 的返回。
+    """
     from api.skills import skill_search_books, skill_show_covers, SearchRequest, ShowCoversRequest
 
     _fake_search(monkeypatch, [
-        {"id": "1", "title": "斗破苍穹", "author": "A", "picture": "https://x.com/1.jpg"},
-        {"id": "2", "title": "斗破苍穹", "author": "B", "picture": "https://x.com/2.jpg"},
+        {"id": "1", "title": "斗破苍穹", "author": "A", "cover": "https://x.com/1.jpg"},
+        {"id": "2", "title": "斗破苍穹", "author": "B", "cover": "https://x.com/2.jpg"},
         {"id": "3", "title": "斗破苍穹", "author": "C"},  # 无封面
     ])
     r = _run(skill_search_books(SearchRequest(keyword="斗破苍穹", source="brand_new_api"), auth=env))
@@ -201,23 +227,40 @@ def test_search_without_covers_has_no_suggestion(env, monkeypatch):
 
 
 # ── ④ 后台添加接口时的封面自检（防止静默失败） ──
-def test_describe_names_the_offending_field():
-    """字段名无语义时，自检必须点名具体字段并给出可复制的修法。"""
+def test_describe_suggests_likely_cover_field():
+    """未映射时，诊断应点名疑似封面字段并给出契约修法。"""
     from core.cover import describe_cover_detection
-    msg = describe_cover_detection({"id": "1", "bookTitle": "书", "bg": "https://x.com/a.jpg"})
-    assert "bg" in msg
-    assert "book['cover']" in msg
+    msg = describe_cover_detection({"id": "1", "bookTitle": "书", "pic": "https://x.com/a.jpg"})
+    assert "pic" in msg
+    assert "bookImage" in msg
+    assert "疑似封面字段" in msg
+
+
+def test_describe_flags_noise_images_as_unlikely():
+    """头像/logo 这类图片必须被标注为「不像封面」，避免误导管理员去映射。"""
+    from core.cover import describe_cover_detection
+    msg = describe_cover_detection({"id": "1", "bookTitle": "书",
+                                    "avatar": "https://x.com/头像.jpg"})
+    assert "avatar" in msg
+    assert "头像" in msg or "而非书籍封面" in msg
 
 
 def test_describe_when_no_image_at_all():
     from core.cover import describe_cover_detection
     msg = describe_cover_detection({"id": "1", "bookTitle": "书"})
-    assert "没有发现任何图片 URL 字段" in msg
+    assert "未发现任何图片 URL" in msg
+
+
+def test_describe_ignores_contract_fields_when_scanning():
+    """已是契约字段的键不该出现在「建议映射」里。"""
+    from core.cover import describe_cover_detection
+    msg = describe_cover_detection({"id": "1", "cover": "not-a-url"})
+    assert "['cover']" not in msg
 
 
 def test_describe_handles_non_dict():
     from core.cover import describe_cover_detection
-    assert "无法提取封面" in describe_cover_detection("not-a-dict")
+    assert "无法读取封面" in describe_cover_detection("not-a-dict")
 
 
 def test_admin_test_endpoint_reports_cover_status(monkeypatch):
@@ -261,22 +304,32 @@ def test_admin_test_endpoint_warns_on_blind_spot(monkeypatch):
 
 
 # ── ⑤ 归一化层：后台添加接口的统一收口点 ──
-@pytest.mark.parametrize("field", [
-    "cover", "bookImage", "pic", "picture", "img", "imgUrl",
-    "thumbnail", "albumCover", "poster", "my_cover_x",
-])
-def test_normalize_book_unifies_any_cover_field(field):
-    """后台添加的脚本接口无论用什么字段名，归一化后都应产出 cover。
+@pytest.mark.parametrize("field", ["cover", "bookImage"])
+def test_normalize_book_accepts_contract_fields(field):
+    """脚本按契约输出 bookImage（或 cover）时，归一化产出标准 cover。
 
     这是网页端 <img :src="item.cover"> 与 AI 封面功能共同依赖的收口点。
-    修复前这里只认 bookImage/cover 两个键，其余命名网页端也显示不出封面。
     """
     from core.interface_manager import ScriptAdapter
     norm = ScriptAdapter._normalize_book(
         {"id": "1", "bookTitle": "书", field: "https://x.com/a.jpg"})
-    assert norm["cover"] == "https://x.com/a.jpg", f"字段 {field} 未被归一化"
+    assert norm["cover"] == "https://x.com/a.jpg", f"契约字段 {field} 未被归一化"
     # bookImage 是前端/批处理的别名，应与 cover 保持一致
     assert norm["bookImage"] == norm["cover"]
+
+
+@pytest.mark.parametrize("field", ["pic", "thumbnail", "albumCover", "avatar", "logo"])
+def test_normalize_book_ignores_unmapped_fields(field):
+    """非契约字段不做猜测——映射是搜索脚本的职责。
+
+    这样既避免把主播头像/站点 logo 误当封面，也让契约保持单一清晰。
+    """
+    from core.interface_manager import ScriptAdapter
+    norm = ScriptAdapter._normalize_book(
+        {"id": "1", "bookTitle": "书", field: "https://x.com/a.jpg"})
+    assert norm["cover"] == ""
+    # 原始字段仍应透传给章节脚本（契约要求），只是不当封面用
+    assert norm[field] == "https://x.com/a.jpg"
 
 
 def test_normalize_book_fixes_protocol_relative_url():

@@ -245,8 +245,8 @@ async def test_interface(name: str, req: InterfaceTest, _: bool = Depends(get_cu
                 "error": s.get("error"),
                 "sample": rows[:3],
             }
-            # 封面自检：明确告诉管理员本接口的封面能否被通用提取器识别，
-            # 避免「加完接口后 AI 显示不了封面」这类静默失败。
+            # 封面自检：确认脚本是否已把封面映射到标准字段（bookImage/cover），
+            # 避免「加完接口后网页与 AI 都显示不了封面」这类静默失败。
             if rows:
                 from core.cover import extract_cover, describe_cover_detection
                 hit = sum(1 for r in rows if extract_cover(r))

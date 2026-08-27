@@ -531,11 +531,11 @@ onMounted(load)
               <div v-if="testResult[sec].cover" class="cover-check"
                    :class="testResult[sec].cover.ok ? 'cover-ok' : 'cover-warn'">
                 <template v-if="testResult[sec].cover.ok">
-                  ✅ 封面已识别（{{ testResult[sec].cover.detected }}/{{ testResult[sec].cover.total }} 条），
-                  AI 可显示封面图
+                  ✅ 封面已读取（{{ testResult[sec].cover.detected }}/{{ testResult[sec].cover.total }} 条），
+                  网页与 AI 均可显示封面
                 </template>
                 <template v-else>
-                  ⚠️ 未识别到封面 —— AI 将无法显示此接口的封面图。
+                  ⚠️ 未读取到封面 —— 网页搜索页与 AI 都将没有封面图。
                   <div class="cover-hint">{{ testResult[sec].cover.hint }}</div>
                 </template>
               </div>

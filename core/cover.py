@@ -1,16 +1,23 @@
-"""书籍封面 — 接口无关的通用提取 + 签名图片代理
+"""书籍封面 — 契约字段读取 + 签名图片代理
 
-设计原则（重要）：**绝不为单个接口写特判**。
+设计原则：**信任接口契约，不猜测**。
 
-1. 提取层 `extract_cover()`：按候选键名清单从任意搜索结果 dict 里挖封面。
-   官方适配器输出 `cover`，脚本适配器 `_normalize_book` 输出 `cover`/`bookImage`，
-   而未来新增的第三方脚本可能直接吐 `pic` / `img` / `thumb` / `avatar` …
-   这里一次性穷举常见键名并支持嵌套，因此**新接口无需改任何代码即可支持封面**。
+后台添加第三方接口时，搜索脚本已经负责把上游千奇百怪的字段
+统一成标准字段（见 core/script_examples.py 的契约）：
 
-2. 投递层 `sign()` / `verify()`：AI 平台的图片渲染器是「无凭证的浏览器」，
-   既不会带 Bearer 头，也常被上游 CDN 的防盗链拦掉。
-   故由本服务器做中转：签发一枚 HMAC 签名、带过期时间的 URL，
-   渲染器直接 GET 即可拿到图片字节，不泄露卡密 token。
+    book = {'id': ..., 'bookTitle': ..., 'bookImage': item.get('随便什么原始字段')}
+
+既然映射工作在脚本里已经完成，本模块**只读契约字段**（cover / bookImage），
+绝不扫描 dict 去「猜」哪个字段像封面。
+
+为什么不猜：搜索结果里的自定义字段会原样透传给章节脚本（契约明确要求），
+因此 dict 中常混有 avatar（主播头像）、logo（站点标识）、qrcode（二维码）、
+shareImage（分享缩略图）等图片 URL。贪心匹配会把它们误当封面显示——
+用户本来就是靠封面区分同名书籍，给错图比不给图更糟。
+
+启发式扫描只保留在 `describe_cover_detection()` 里，作为后台「测试接口」时
+给管理员看的**诊断建议**（提示「你是不是想把 xxx 映射成 bookImage」），
+永远不参与运行时取值。
 """
 
 import base64
@@ -26,25 +33,19 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-# ── 候选键名：从最规范到最少见，命中即止 ──
-# 新接口只要用了其中任意一种命名，封面功能自动生效。
-_COVER_KEYS = (
-    "cover", "cover_url", "coverUrl", "cover_path", "coverPath",
-    "bookImage", "book_image", "albumCover", "album_cover",
-    "image", "imageUrl", "image_url", "img", "imgUrl", "img_url",
-    "pic", "picUrl", "pic_url", "picture", "photo",
-    "thumb", "thumbnail", "thumbUrl", "thumb_url",
-    "logo", "avatar", "poster", "middleCover", "largeCover",
-)
-
-# 可能藏着封面的嵌套容器
-_NESTED_KEYS = ("novel", "book", "album", "info", "data", "detail")
+# 契约字段：脚本接口按 script_examples.py 的约定输出 bookImage；
+# cover 是适配器归一化后的标准名，官方适配器也用它。二者之外一律不认。
+_CONTRACT_KEYS = ("cover", "bookImage")
 
 _IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
 
 
 def normalize_cover_url(url: Any) -> str:
-    """协议补全 + 去空白。`//img.x.com/a.jpg` → `https://img.x.com/a.jpg`"""
+    """协议补全 + 校验。`//img.x.com/a.jpg` → `https://img.x.com/a.jpg`
+
+    非字符串、空值、或不是 http(s)/data:image 的内容一律返回空串，
+    避免把 'null'、'暂无封面' 这类脏数据塞进 <img src>。
+    """
     if not url or not isinstance(url, str):
         return ""
     u = url.strip()
@@ -57,70 +58,56 @@ def normalize_cover_url(url: Any) -> str:
     return ""
 
 
-def _looks_like_image(value: Any) -> bool:
-    if not isinstance(value, str) or not value.strip():
-        return False
-    v = value.strip().lower()
-    if v.startswith("data:image/"):
-        return True
-    if not (v.startswith("http://") or v.startswith("https://") or v.startswith("//")):
-        return False
-    path = urlparse(v if not v.startswith("//") else "https:" + v).path
-    # 带图片扩展名 → 确定；无扩展名的 CDN 动图链接也放行（很多接口如此）
-    return path.endswith(_IMAGE_EXT) or True
+def extract_cover(item: Any) -> str:
+    """读取契约字段中的封面 URL 并做协议补全；没有则返回空串。
 
-
-def extract_cover(item: Any, _depth: int = 0) -> str:
-    """从任意结构的搜索结果中提取封面 URL；提取不到返回空串。
-
-    与接口实现完全解耦：先按候选键名匹配，再递归下探常见嵌套容器。
+    只认 cover / bookImage —— 字段映射是搜索脚本的职责，不在这里猜。
     """
-    if not isinstance(item, dict) or _depth > 3:
+    if not isinstance(item, dict):
         return ""
-    for key in _COVER_KEYS:
-        if key in item:
-            url = normalize_cover_url(item.get(key))
-            if url and _looks_like_image(item.get(key)):
-                return url
-    # 兜底：键名含 cover/image/pic/img 且值像图片 URL
-    for key, value in item.items():
-        if not isinstance(key, str):
-            continue
-        k = key.lower()
-        if any(tag in k for tag in ("cover", "image", "img", "pic", "thumb")):
-            url = normalize_cover_url(value)
-            if url and _looks_like_image(value):
-                return url
-    for key in _NESTED_KEYS:
-        nested = item.get(key)
-        if isinstance(nested, dict):
-            found = extract_cover(nested, _depth + 1)
-            if found:
-                return found
+    for key in _CONTRACT_KEYS:
+        url = normalize_cover_url(item.get(key))
+        if url:
+            return url
     return ""
 
 
-def describe_cover_detection(item: Any) -> str:
-    """封面没被识别时，给管理员一句可执行的说明（后台「测试接口」用）。
+# ── 仅用于后台诊断：帮管理员定位「该把哪个字段映射成 bookImage」──
+_HINT_SCAN_KEYS = ("cover", "image", "img", "pic", "thumb", "photo", "poster")
+# 这些几乎肯定不是书籍封面，诊断时明确排除，避免误导管理员
+_HINT_EXCLUDE = ("avatar", "logo", "qrcode", "qr_code", "share", "icon", "banner", "ad")
 
-    会扫描该条结果里所有「看起来像图片 URL」的字段，直接点名建议改成 cover。
+
+def describe_cover_detection(item: Any) -> str:
+    """封面为空时，给管理员一句可执行的说明（后台「测试接口」用）。
+
+    这里会扫描疑似图片字段作为**建议**，但绝不影响运行时取值。
     """
     if not isinstance(item, dict):
-        return "搜索结果不是标准字典结构，无法提取封面。"
-    candidates = [k for k, v in item.items()
-                  if isinstance(k, str) and normalize_cover_url(v) and _looks_like_image(v)]
-    if candidates:
-        return (
-            f"该接口返回了疑似图片字段 {candidates}，但字段名不含 "
-            "cover/image/img/pic/thumb 等可识别语义，因此未被自动识别。"
-            f"请在搜索脚本里把它改名或补一份为 cover，例如："
-            f"book['cover'] = item.get('{candidates[0]}')"
-        )
-    return (
-        "该接口的搜索结果里没有发现任何图片 URL 字段。"
-        "若上游确实提供封面，请在搜索脚本中取出并以 cover 为键返回："
-        "book['cover'] = item.get('你的字段名')"
-    )
+        return "搜索结果不是标准字典结构，无法读取封面。"
+
+    likely, unlikely = [], []
+    for k, v in item.items():
+        if not isinstance(k, str) or k in _CONTRACT_KEYS:
+            continue
+        if not normalize_cover_url(v):
+            continue
+        lower = k.lower()
+        if any(bad in lower for bad in _HINT_EXCLUDE):
+            unlikely.append(k)
+        elif any(tag in lower for tag in _HINT_SCAN_KEYS):
+            likely.append(k)
+        else:
+            unlikely.append(k)
+
+    base = ("未读取到封面：搜索脚本需要把封面映射到标准字段 bookImage（或 cover），"
+            "例如 book['bookImage'] = item.get('上游字段名')。")
+    if likely:
+        return base + f" 该接口返回了疑似封面字段 {likely}，可优先尝试。"
+    if unlikely:
+        return (base + f" 另外检测到图片字段 {unlikely}，"
+                "但它们看起来像头像/图标/分享图而非书籍封面，请确认后再映射。")
+    return base + " 当前结果中未发现任何图片 URL，可能该接口本身不提供封面。"
 
 
 # ════════════════════════════════════════
