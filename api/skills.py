@@ -25,7 +25,8 @@ from core import config as _config
 from core import cover as cover_mod
 from core.cover import extract_cover
 from core.account_manager import list_accounts
-from api.extension import list_local_tasks, create_local_task, CreateTaskRequest
+from api.extension import (list_local_tasks, create_local_task, CreateTaskRequest,
+                       _release_slot)
 
 logger = logging.getLogger(__name__)
 
@@ -664,14 +665,25 @@ def skill_reset_stuck_local_task(req: TaskIdRequest, auth: dict = Depends(get_cu
             
         if task.status != "running":
             return {"success": False, "message": f"任务当前状态为 {task.status}，无需重置。"}
-            
+
         task.status = "pending"
         task.claim_id = None
+        task.claim_session = None      # 「谁在下」的归属指纹，必须与 claim 一起清（否则 /tasks 仍显示旧持有者）
         task.claimed_at = None
+        task.heartbeat_at = None
+        task.lease_until = None
         db.commit()
+        # ⚠️ 只改任务状态不够：全局下载槽（card_download_locks）此刻仍被旧 claim 持有且租约未过期，
+        # 插件 30s 后重新 claim 会撞 409「当前卡密已有下载任务进行中」——原来那句「30 秒内重新接管」
+        # 因此是空头承诺，用户会以为重置没生效。必须同时释放槽（与 sweep/管理员强制释放同一套语义）。
+        released = _release_slot(auth["card_id"], req.task_id)
         return {
-            "success": True, 
-            "message": "已成功将僵尸任务打回排队池。请提示用户打开浏览器并确保插件开启，插件会在 30 秒内重新接管并继续下载。"
+            "success": True,
+            "slot_released": released,
+            "message": ("已成功将僵尸任务打回排队池并释放下载槽。请提示用户打开浏览器并确保插件开启，"
+                        "插件会在 30 秒内重新接管并继续下载。" if released else
+                        "任务已打回排队池，但下载槽暂时没释放成功：它最长会在一个租约周期（默认 300 秒）"
+                        "后自动回收，届时插件自动接管；如需立刻恢复请在后台点「强制释放下载槽」。"),
         }
     except Exception as e:
         db.rollback()

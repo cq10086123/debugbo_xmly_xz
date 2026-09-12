@@ -23,6 +23,9 @@ const fields = [
   { key: 'session_idle_days', label: '会话空闲过期(天)', type: 'number' },
   { key: 'trust_proxy_header', label: '信任反代IP头(XFF)', type: 'bool' },
   { key: 'token_multi_ip_kick', label: '同token多IP强制下线', type: 'bool' },
+  // 下载租约回退开关（插件下载误报用）：def = 库里没有该行时的生效默认值，仅用于展示
+  { key: 'slot_renew_relaxed', label: '租约过期可原地续租', type: 'bool', def: '1' },
+  { key: 'heartbeat_infra_error_mode', label: '心跳异常响应方式', type: 'text', def: 'success_degraded' },
 ]
 
 const cfg = reactive({})
@@ -31,7 +34,13 @@ async function load() {
   loading.value = true
   try {
     const r = await adminApi.get('/config')
-    if (r.data.success) Object.assign(cfg, r.data.config || {})
+    if (r.data.success) {
+      Object.assign(cfg, r.data.config || {})
+      // 未落库的开关按生效默认值展示，避免「界面显示关闭、服务端其实开启」的误导
+      for (const f of fields) {
+        if ((cfg[f.key] === undefined || cfg[f.key] === null) && f.def !== undefined) cfg[f.key] = f.def
+      }
+    }
   } catch (e) {}
   loading.value = false
 }
@@ -107,7 +116,10 @@ onMounted(load)
       <p class="muted hint">
         「后台管理地址」即管理后台的 URL 段（当前为 <b>{{ cfg.admin_path || 'admin' }}</b>，入口 /#/{{ cfg.admin_path || 'admin' }}）。
         小写字母开头，仅含小写字母/数字/-/_，修改后<b>需重启服务</b>才生效。
-        管理后台 API 与文档页受「局域网访问限制」开关控制：开启时仅允许局域网 IP 访问，关闭后公网也可访问（请确保已修改强密码，并尽量走 HTTPS）。
+        管理后台 API 与文档页受「局域网访问限制」开关控制：开启时仅允许局域网 IP 访问，关闭后公网也可访问（请确保已修改强密码，并尽量走 HTTPS）。<br />
+        「租约过期可原地续租」= 下载插件心跳晚了一拍但没被别人接走时，允许原地续命而不中断下载（异常时可关掉回到旧行为）。
+        「心跳异常响应方式」默认 <b>success_degraded</b>（服务器读不到租约状态时不打断下载）；
+        仅当所有客户端插件 ≥ 0.7.2 时才可改为 <b>http_503</b>，否则老插件会把 503 误当凭证失效而中断下载。
         <br />
         「网络绑定」开启后按<b>出口 IP</b>限制登录环境：同一公网 IP（同一家庭宽带，IPv4 按 /24、IPv6 按 /48 归一，局域网视为同一网络）下<b>不限设备与浏览器数量</b>；
         只有换到另一个公网 IP 登录才触发顶号换绑（淘汰同族最早绑定的网络并踢其会话）。网络数按 IPv4/IPv6 分别计算（双栈家庭 v4、v6 各占各的名额，互不误踢），默认每族 1 个，卡密管理中可按卡调整（设 2 可同时容纳家里+公司）。

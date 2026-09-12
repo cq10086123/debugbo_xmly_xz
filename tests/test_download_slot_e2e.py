@@ -530,8 +530,16 @@ def test_claim_race_single_winner(env):
     assert r.status_code == 200
 
 
-def test_lease_expiry_sweep_and_reclaim(env):
-    """租约过期 ⇒ 锁失效 + 心跳 409 + sweep 回退 pending + 可被再次 claim。"""
+def test_lease_expiry_sweep_and_reclaim(env, monkeypatch):
+    """租约过期 ⇒ 锁失效 + 心跳 409 + sweep 回退 pending + 可被再次 claim。
+
+    2026-09-12 修订：默认语义已改为「过期但仍是我持有本次 claim ⇒ 原地续命」（修 A2 误报），
+    本用例因此在开头显式关闭回退开关 slot_renew_relaxed，覆盖的是
+    「管理员把开关关掉 ⇒ 行为与 0.7.1 完全一致」这条回退路径。
+    默认（宽松）语义见 test_lease_expiry_renews_in_place。
+    """
+    import api.extension as ext
+    monkeypatch.setattr(ext, "_renew_relaxed", lambda: False)
     c, a = env["client"], env["card_a"]
     from core import download_slot
     tid = _push_task(env, album=3)
@@ -591,6 +599,86 @@ def test_lease_expiry_sweep_and_reclaim(env):
     assert r6.status_code == 200, r6.text
     c.post(f"/api/extension/tasks/{tid}/complete",
            json={"claim_id": r6.json()["task"]["claim_id"], "progress": {}}, headers=H(env))
+
+
+def test_lease_expiry_renews_in_place(env):
+    """默认语义（修复后）：租约过期但 claim 未被他人改写 ⇒ 心跳原地续命，下载不被打断。
+
+    这条覆盖的是用户报的「下载中断（租约失效）」主因：插件只要还活着、凭证还是本次 claim 的，
+    就不该因为「心跳晚了一拍」被踢。同时必须保住两件事：
+    1. 单下载槽不变：别的任务此刻仍不能抢走这个槽（否则等于允许并发下载）；
+    2. 真被接管时仍拦得住：别人的 claim 一旦改写 claim_id，旧设备心跳立刻 409。
+    """
+    import time
+    import api.extension as ext
+    from db.session import SessionLocal
+    from db.models import LocalTask
+    from core import download_slot
+
+    c, a = env["client"], env["card_a"]
+    download_slot.release(a, "cleanup")
+    tid = _push_task(env, album=31)
+    r = c.post(f"/api/extension/tasks/{tid}/claim", headers=H(env))
+    assert r.status_code == 200, r.text
+    claim_id = r.json()["task"]["claim_id"]
+
+    # 模拟「SW 被挂起 / 心跳迟到一个租约周期」：锁与任务的租约都拨到过去，但 claim 没被人改过
+    db = SessionLocal()
+    try:
+        db.connection().exec_driver_sql(
+            "UPDATE card_download_locks SET lease_until = :p WHERE card_id = :c",
+            {"p": "2020-01-01 00:00:00.000000", "c": a})
+        t = db.query(LocalTask).filter_by(task_id=tid).first()
+        t.lease_until = datetime(2020, 1, 1)
+        db.commit()
+    finally:
+        db.close()
+
+    r2 = c.post(f"/api/extension/tasks/{tid}/heartbeat",
+                json={"claim_id": claim_id}, headers=H(env))
+    assert r2.status_code == 200, r2.text
+    body = r2.json()
+    assert body["success"] is True and body.get("degraded") is None
+    assert body["renewed_after_expiry"] is True       # 观测位：这条就是历史上被误杀的那一类
+    # 不变式而不是白名单：一个租约周期内至少 4 拍（老插件按 30s 固定节奏，忽略该字段）
+    assert 5 <= ext._beat_seconds() <= download_slot.LOCAL_TTL_SECONDS // 4, \
+        f"心跳节奏与租约不匹配: beat={ext._beat_seconds()} ttl={download_slot.LOCAL_TTL_SECONDS}"
+
+    # 续约必须把两本账都推回未来
+    db = SessionLocal()
+    try:
+        t = db.query(LocalTask).filter_by(task_id=tid).first()
+        assert t.lease_until > datetime.utcnow() - timedelta(seconds=5)
+    finally:
+        db.close()
+    lock = download_slot.get_lock(a)
+    assert lock and not lock["expired"] and lock["task_id"] == tid
+
+    # 单下载槽语义不变：另一本书此刻必须仍被挡在门外
+    tid2 = _push_task(env, album=32)
+    r3 = c.post(f"/api/extension/tasks/{tid2}/claim", headers=H(env))
+    assert r3.status_code == 409, "已过期但仍是本持有者 ⇒ 不许被别的任务抢走"
+
+    # 真被接管（claim_id 被改写）⇒ 旧设备心跳必须 409，且带 code=lost
+    db = SessionLocal()
+    try:
+        t = db.query(LocalTask).filter_by(task_id=tid).first()
+        t.claim_id = "someone-else"
+        db.commit()
+    finally:
+        db.close()
+    r4 = c.post(f"/api/extension/tasks/{tid}/heartbeat",
+                json={"claim_id": claim_id}, headers=H(env))
+    assert r4.status_code == 409 and r4.json()["code"] == "lost"
+
+    # 收尾：还原任务，避免影响后续用例
+    db = SessionLocal()
+    try:
+        db.query(LocalTask).filter(LocalTask.task_id.in_([tid, tid2])).delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+    download_slot.release(a, tid)
 
 
 def test_cancel_claimed_task(env):
