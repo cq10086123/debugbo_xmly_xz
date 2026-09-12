@@ -151,3 +151,67 @@ def test_reset_message_honest_when_slot_gone(env):
     body = r.json()
     assert body["success"] is True and body["slot_released"] is True, body
     assert "下载槽暂时没释放成功" not in body["message"]
+
+
+# ════════════════════════════════════════
+#  D4：get_card_info 必须真能用（旧实现读不存在的 card.expire_time ⇒ 500）
+# ════════════════════════════════════════
+def _card_with(**kw):
+    from db.models import Card
+    from api.card_helpers import issue_skill_token
+    db = SessionLocal()
+    try:
+        c = Card(code=f"GI-{RUN}-{uuid.uuid4().hex[:5]}", status="active",
+                 skill_token=issue_skill_token(), **kw)
+        db.add(c)
+        db.commit()
+        tok = c.skill_token
+    finally:
+        db.close()
+    return tok
+
+
+def test_get_card_info_fixed_expiry(env):
+    from datetime import timedelta
+    tok = _card_with(expiry_type="fixed",
+                     expires_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=3))
+    r = env["client"].post("/api/skills/get_card_info", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200, r.text          # 旧实现在这里 500
+    b = r.json()
+    assert b["success"] is True and "error" not in b, b
+    assert b["is_expired"] is False
+    assert "(UTC)" in b["expire_time"], b["expire_time"]
+    assert 2 * 86400 < b["remaining_seconds"] <= 3 * 86400, b
+    assert b["remaining_text"] and "天" in b["remaining_text"], b
+
+
+def test_get_card_info_days_based_and_permanent(env):
+    from datetime import timedelta
+    tok = _card_with(expiry_type="days", valid_days=30,
+                     activated_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=29))
+    b = env["client"].post("/api/skills/get_card_info",
+                           headers={"Authorization": f"Bearer {tok}"}).json()
+    assert b["success"] is True and b["expire_time"] == "激活日起 30 天", b
+    assert b["remaining_seconds"] is not None and b["remaining_seconds"] <= 86400, b
+
+    perm = _card_with(expiry_type="fixed", expires_at=None)
+    b2 = env["client"].post("/api/skills/get_card_info",
+                            headers={"Authorization": f"Bearer {perm}"}).json()
+    assert b2["success"] is True and b2["expire_time"] == "永久有效", b2
+    assert b2["is_expired"] is False and b2["remaining_seconds"] is None, b2
+
+    # 边界：expires_at 已过但 status 仍 active ⇒ 鉴权会拦；这里只保证不 500（见下一个用例）
+
+
+def test_get_card_info_expired_card_is_rejected_not_500(env):
+    """过期卡密的 SKILL 凭证应在鉴权层就被拒（而不是接口 500 或被判成"永久有效"）。
+
+    旧实现里 `card.expire_time` 抛 AttributeError ⇒ 任何卡密调用都是 500；修完后必须
+    区分两种情况：鉴权拒绝（401，设计如此）与正常返回（200 + is_expired 口径正确）。
+    """
+    from datetime import timedelta
+    tok = _card_with(expiry_type="fixed",
+                     expires_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1))
+    r = env["client"].post("/api/skills/get_card_info", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 401, (r.status_code, r.text)
+    assert "expire_time" not in r.text, "不许把 AttributeError 当成响应返回"

@@ -77,6 +77,11 @@ const DEFAULT_SETTINGS = {
 
 const MAX_RETRY = 3                     // 重试次数兜底默认值（设置里可调）
 const TRACK_TIMEOUT = 30 * 60 * 1000    // 单集下载终端态等待上限（超时标记失败，防槽位泄漏）
+const RESOLVE_TIMEOUT_MS = 90 * 1000  // 单集"解析直链"上限。必须远小于 TRACK_TIMEOUT：
+                                      // 解析挂住时这一集既不失败也不完成，claim 心跳照发 ⇒ 下载槽被
+                                      // 无限期占住（别的设备一直看到「其他设备正在下载」，服务器 sweep
+                                      // 也不会触发，因为插件是活的）。90s 后走既有的 maxRetry 重试，
+                                      // 重试用尽即记为该集失败，任务照常收尾并释放槽。
 
 let offscreenReady = false
 let keepAliveActive = false
@@ -1342,7 +1347,10 @@ async function runTrack(taskId, trackId) {
       })
       if (shouldSkip) return
 
-      const url = await resolveForTrack(task, tr, { serverUrl, token })
+      // D8：解析阶段以前是裸 await —— 挂住就永远挂着（见 RESOLVE_TIMEOUT_MS 的注释）
+      const url = await withTimeout(
+        resolveForTrack(task, tr, { serverUrl, token }),
+        RESOLVE_TIMEOUT_MS, '解析直链')
       if (!url) throw new Error('解析结果为空')
       const fname = buildFilename(task, tr, settings.downloadPrefix)
       console.log('[plugin] start download', trackId, fname)
@@ -1401,6 +1409,19 @@ function downgradeCertBrokenUrl(url) {
     u.protocol = 'http:'
     return u.toString()
   } catch (e) { return url.replace(/^https:\/\//, 'http://') }
+}
+
+// 给"可能永远不返回"的异步操作套上限（解析直链要等 cookie、等 offscreen 签名、等音源响应，
+// 任一环挂住就没有任何超时）。超时按"该次尝试失败"处理，交给调用方已有的 maxRetry 重试。
+function withTimeout(promise, ms, label) {
+  let timer = null
+  const guarded = Promise.resolve(promise).finally(() => { if (timer) clearTimeout(timer) })
+  return Promise.race([
+    guarded,
+    new Promise((_res, rej) => {
+      timer = setTimeout(() => rej(new Error((label || '操作') + `超时（${Math.round(ms / 1000)}s）`)), ms)
+    }),
+  ])
 }
 
 async function resolveForTrack(task, tr, ctx) {

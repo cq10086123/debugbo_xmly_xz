@@ -695,27 +695,32 @@ def skill_reset_stuck_local_task(req: TaskIdRequest, auth: dict = Depends(get_cu
 def skill_get_card_info(auth: dict = Depends(get_current_card_skill)):
     from db.session import SessionLocal
     from db.models import Card
-    import time
-    
+    from api.card_helpers import card_public_info, is_expired as _card_is_expired
+
+    # 修 D4：旧实现读 card.expire_time —— 模型里没有这个字段（真实字段是
+    # expires_at / expiry_type / valid_days / activated_at），于是每次调用都 AttributeError →
+    # 接口 500，SKILL 侧完全拿不到卡密状态。改成复用网页端同一套算法，避免两处口径漂移。
     db = SessionLocal()
     try:
         card = db.query(Card).filter_by(id=auth["card_id"]).first()
         if not card:
             return {"success": False, "error": "卡密不存在"}
-        
-        is_expired = False
+
+        info = card_public_info(card)
         expire_time_str = "永久有效"
-        if card.expire_time:
-            is_expired = time.time() > card.expire_time
-            from datetime import datetime
-            expire_time_str = datetime.fromtimestamp(card.expire_time).strftime('%Y-%m-%d %H:%M:%S')
-            
+        if info["expires_at"]:
+            expire_time_str = str(info["expires_at"]).replace("T", " ")[:19] + " (UTC)"
+        elif info["valid_days"] and info["activated_at"]:
+            expire_time_str = f"激活日起 {info['valid_days']} 天"
+
         return {
             "success": True,
             "card_code": card.code,
-            "is_expired": is_expired,
+            "is_expired": _card_is_expired(card),
             "expire_time": expire_time_str,
-            "download_mode": card.download_mode or "both"
+            "remaining_seconds": info["remaining_seconds"],
+            "remaining_text": info["remaining_text"],
+            "download_mode": card.download_mode or "both",
         }
     finally:
         db.close()

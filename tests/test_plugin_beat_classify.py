@@ -264,3 +264,50 @@ def test_handle_claim_lost_uses_the_pure_decision():
     assert "decideClaimLost({" in seg, "handleClaimLost 又改成内联判断了（无法单测，且顺序易错）"
     assert "serverPending.includes" not in seg and "serverRunning.includes" not in seg, \
         "残留的 serverRunning/serverPending 分支会绕过 listFresh 的顺序约束"
+
+
+# ════════════════════════════════════════
+#  D8：解析阶段必须有上限（否则一集挂住 ⇒ 下载槽被无限期占住）
+# ════════════════════════════════════════
+def test_resolve_is_time_bounded():
+    body = JS.read_text(encoding="utf-8")
+    assert "RESOLVE_TIMEOUT_MS" in body, "解析超时上限被删了（D8 会复活）"
+    seg = body[body.index("async function runTrack"):] if "async function runTrack" in body else body
+    i = seg.index("resolveForTrack(task, tr")
+    assert "withTimeout(" in seg[max(0, i - 160):i], "解析调用点又变成裸 await 了"
+    # 常量行尾带中文注释，取 // 之前的部分再求值
+    consts = dict(re.findall(r"const (TRACK_TIMEOUT|RESOLVE_TIMEOUT_MS) = ([^\n]+)", body))
+    nums = {k: eval(v.split("//")[0].strip().replace(" ", "")) for k, v in consts.items()}
+    assert nums["RESOLVE_TIMEOUT_MS"] < nums["TRACK_TIMEOUT"], \
+        "解析上限必须小于整集超时，否则槽位仍会被长期占住"
+    assert nums["RESOLVE_TIMEOUT_MS"] <= 120_000, "解析上限设得过长：卡住的集会长时间占着单下载槽"
+
+
+def test_with_timeout_semantics():
+    """withTimeout 三条契约：正常值透传 / 挂起必拒 / 原错误不被吞（ClaimLostError 依赖它）。"""
+    body_all = JS.read_text(encoding="utf-8")
+    fn = _extract_fn(body_all, "withTimeout")
+    script = f"""
+const SRC = {json.dumps(fn)}
+const withTimeout = new Function('return (' + SRC + ')')()
+const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+const out = []
+out.push('value:' + (await withTimeout(Promise.resolve('mp3-url'), 500, '解析')))
+const t0 = Date.now()
+try {{ await withTimeout(new Promise(() => {{}}), 120, '解析直链'); out.push('hang:resolved') }}
+catch (e) {{ out.push('hang:' + (/超时/.test(e.message) ? 'rejected' : 'wrong-err:' + e.message) + ':' + (Date.now() - t0 >= 100 ? 'in-time' : 'too-early')) }}
+try {{ await withTimeout(Promise.reject(new Error('claim-lost')), 500, '解析'); out.push('rej:swallowed') }}
+catch (e) {{ out.push('rej:' + e.message) }}
+await sleep(60)                       // 让 finally 的 clearTimeout 有机会把 timer 清掉
+console.log(JSON.stringify(out))
+"""
+    fd, tmp = tempfile.mkstemp(suffix=".mjs")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(script)
+    try:
+        out = subprocess.run([node, tmp], capture_output=True, text=True, timeout=60)
+    finally:
+        os.unlink(tmp)
+    assert out.returncode == 0, out.stderr[-1200:]
+    res = json.loads(out.stdout.strip().splitlines()[-1])
+    assert res == ["value:mp3-url", "hang:rejected:in-time", "rej:claim-lost"], res
