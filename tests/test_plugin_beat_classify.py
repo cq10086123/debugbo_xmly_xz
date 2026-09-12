@@ -311,3 +311,45 @@ console.log(JSON.stringify(out))
     assert out.returncode == 0, out.stderr[-1200:]
     res = json.loads(out.stdout.strip().splitlines()[-1])
     assert res == ["value:mp3-url", "hang:rejected:in-time", "rej:claim-lost"], res
+
+
+# ════════════════════════════════════════
+#  0.7.3：frozen（「其他设备正在下载此任务」）不许再由内存态猜
+# ════════════════════════════════════════
+def test_ownership_comes_from_server():
+    body = JS.read_text(encoding="utf-8")
+    i = body.index("async function pollBackend")
+    seg = body[i:body.index("\n}\n", i + 200)] if False else body[i:i + 6000]
+    assert "isOwnedHere(t, claimedId)" in seg, "\u65b0\u4efb\u52a1\u7684 frozen \u53c8\u5f00\u59cb\u7528\u5185\u5b58\u6001\u731c\u4e86"
+    assert "await claimStateReady" in seg, "\u51b7\u542f\u52a8\u7ade\u6001\u53c8\u56de\u6765\u4e86"
+    assert "\u89e3\u9664\u8bef\u6807\u7684 frozen" in body, "\u5347\u7ea7\u540e\u5df2\u5b58\u7684\u8bef\u51bb\u7ed3\u679c\u5fc5\u987b\u81ea\u6108"
+    assert re.search(r"const frozen = t\.status === 'running' && !isOwnedHere", body), \
+        "frozen 判定必须只看服务器 mine/owner，不看 claimState 是否为空"
+
+
+def test_is_owned_here_truth_table():
+    body = JS.read_text(encoding="utf-8")
+    fn = _extract_fn(body, "isOwnedHere")
+    script = f"""
+const SRC = {json.dumps(fn)}
+const isOwnedHere = new Function('return (' + SRC + ')')()
+const cases = [
+  // [entry, claimedId, 期望]
+  [{{task_id:'A', mine:true}},  null, true],    // 服务器说是我的：claimState 丢了也算我的（就是这次的误报）
+  [{{task_id:'A', mine:false}}, 'A',  false],   // 服务器说不是：即便本地内存还以为是我的，也听服务器的
+  [{{task_id:'A', mine:true}},  'B',  true],    // 本机 claim 着 B，但 A 也归本机（多任务/接管中）
+  [{{task_id:'A'}},             null, true],    // 老服务器无 mine + 状态未恢复 ⇒ 不猜"别人"，交给 claim 端点裁决
+  [{{task_id:'A'}},             'B',  false],   // 老服务器无 mine，但本机明确 claim 着 B ⇒ A 不是我的
+]
+console.log(JSON.stringify(cases.map(([e, c, want]) => (isOwnedHere(e, c) === want) ? 'ok' : `FAIL ${{JSON.stringify(e)}}/${{c}}`)))
+"""
+    fd, tmp = tempfile.mkstemp(suffix=".mjs")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(script)
+    try:
+        out = subprocess.run([node, tmp], capture_output=True, text=True, timeout=60)
+    finally:
+        os.unlink(tmp)
+    assert out.returncode == 0, out.stderr[-1200:]
+    res = json.loads(out.stdout.strip().splitlines()[-1])
+    assert res == ["ok"] * 5, res

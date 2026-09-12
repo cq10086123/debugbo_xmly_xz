@@ -344,6 +344,7 @@ async function updateTrack(taskId, trackId, patch) {
 // ════════════════════════════════════════
 const STORAGE_CLAIM = 'xm_claim'
 let claimState = null          // {taskId, claimId, leaseSeconds, lastBeatAt, beatFails}
+let claimStateReady = Promise.resolve()   // 启动时指向 loadClaimState()；alarm 唤醒的冷启动会抢在它前面
 let claimPending = false       // 用户显式请求（全部下载/开始）尚未兑现
 let claimQueue = []            // 槽忙时排队的显式 claim（开始/重试失败集），FIFO
 let lastServerTasks = []       // 最近一次 GET /tasks（pending+running），claim 失效时重新同步用
@@ -403,6 +404,17 @@ async function saveClaimState() {
 async function clearClaimState() {
   claimState = null
   await new Promise(r => chrome.storage.local.remove([STORAGE_CLAIM], r))
+}
+
+// 「这本任务是不是本机在下」的唯一可信判据。0.7.2 及以前用 claimState.taskId（SW 内存态）
+// 反推归属：claimState 尚未恢复 / 被浏览器冻结后为 null，于是"服务器显示 running 的任务"
+// 全部被判成别人的 —— 包括本机自己下的那本，弹出「其他设备正在下载此任务」、pump 跳过、
+// 重试按钮也被禁，直到服务器租约超时把任务打回 pending 才自愈（一台机器、独立卡密也会中招）。
+// 现在只信服务器下发的 mine（同会话指纹比对）；老服务器不下发 mine 时才回退到 claimState，
+// 且回退路径在 claimState 为空时**不**判定为别人（claim 端点还会给出权威的 busy，不会真抢）。
+function isOwnedHere(entry, claimedId) {
+  if (entry && typeof entry.mine === 'boolean') return entry.mine
+  return claimedId == null || !entry || entry.task_id === claimedId
 }
 
 // claim 一本书（指定 task_id 或让服务端选最早的 pending）
@@ -759,6 +771,7 @@ function scheduleClaimNext() {
 // 关键：finalizeTask 会先把本地 status 标成 done，此时仍必须 complete，
 // 绝不能只清本地 claimState（否则服务器槽不释放，下一本永远 409）。
 async function tickClaim() {
+  await claimStateReady      // 同上：恢复完再动 claim 状态机，避免冷启动重复 claim / 误判归属
   if (tickingClaim) { tickClaimQueued = true; return }
   tickingClaim = true
   try {
@@ -863,7 +876,8 @@ chrome.downloads.onChanged.addListener(handleDownloadChanged)
 // 启动：静默下载 UI → 恢复 claim 状态 → 拉取任务 → 校正历史下载状态（SW 被杀重启场景）→ claim 状态机 → 派发续传
 applySilentMode()
 pollAnnouncement().catch(() => {})
-loadClaimState()
+claimStateReady = loadClaimState()
+claimStateReady
   .then(() => pollBackend())
   .then(() => reconcileDownloads())
   .then(() => tickClaim())
@@ -945,6 +959,7 @@ async function pollAnnouncement() {
 // 0.7.0 新流程不再 ack：任务生命周期由 claim/heartbeat/complete/cancel 驱动，
 // pending 任务会持续出现在列表中直到被 claim（本插件幂等去重，重复出现无副作用）。
 async function pollBackend() {
+  await claimStateReady          // 归属判定依赖 claimState：不等它恢复完就会误判（见 isOwnedHere）
   const { serverUrl, token } = await cfg()
   if (!serverUrl || !token) return
   let data
@@ -974,7 +989,7 @@ async function pollBackend() {
       const tracks = (t.tracks || []).map(tr => ({
         ...tr, status: 'pending', error: '', downloadId: null,
       }))
-      const frozen = t.status === 'running' && t.task_id !== claimedId
+      const frozen = t.status === 'running' && !isOwnedHere(t, claimedId)
       const newTask = {
         ...t, tracks,
         status: frozen ? 'running' : 'pending',
@@ -1005,6 +1020,7 @@ async function pollBackend() {
       const task = await getTask(item.task_id)
       if (!task) continue
       if (task.task_id === claimedId) continue
+      const owned = isOwnedHere(st || { task_id: item.task_id }, claimedId)
       if (!st) {
         // 服务器侧已消失（done/cancelled/被删）：本地 pending 的移除；
         // 本地 done/cancelled 保留展示；frozen 展示任务保留（等待用户处理）
@@ -1016,8 +1032,17 @@ async function pollBackend() {
         continue
       }
       let taskDirty = false
-      if (st.status === 'running' && task.status === 'pending') {
-        // 其他设备 claim 了它：本地转 frozen 展示，不下载
+      if (task.frozen && st.status === 'running' && owned) {
+        // 自愈：上一版把本机自己的任务误标成 frozen（claimState 为 null 时猜错），
+        // 服务器明确说这本就是本机 claim 的 ⇒ 解冻回 pending，交给 pump 继续 claim。
+        // 没有这段的话，升级后老用户存储里已经 frozen 的行会永久卡住（它只在服务器
+        // 把任务打回 pending 时才解冻，而它自己一直占着租约所以永远是 running）。
+        console.warn('[plugin] 服务器显示任务属于本机，解除误标的 frozen', task.task_id)
+        task.status = 'pending'; task.frozen = false; task.errorMsg = ''
+        item.status = 'pending'; item.frozen = false
+        taskDirty = true; changed = true
+      } else if (st.status === 'running' && task.status === 'pending' && !owned) {
+        // 其他设备 claim 了它：本地转 frozen 展示，不下载（服务器判定，不再靠猜）
         task.status = 'running'; task.frozen = true
         task.errorMsg = '其他设备正在下载此任务'
         item.status = 'running'; item.frozen = true
