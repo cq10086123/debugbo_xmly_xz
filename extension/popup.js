@@ -79,7 +79,10 @@ async function showMain() {
   if (token) {
     $('loginBox').style.display = 'none'
     $('mainBox').style.display = 'block'
+    // 插件版本号显示在这里：发版/公告时让用户（和你自己）能一眼确认"重载生效了没有"
+    const ver = (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || '?'
     $('who').innerHTML = `已登录：<b>${escapeHtml((card && card.code) || '')}</b>`
+      + ` <span style="opacity:.6">v${ver}</span>`
     await swCall('pullTasks').catch(() => {})
     await loadSettings()
     await renderQueue()
