@@ -17,7 +17,6 @@
 """
 
 import hashlib
-import hashlib
 import json
 import logging
 import threading
@@ -541,7 +540,6 @@ async def heartbeat_task(task_id: str, req: HeartbeatRequest,
     下载槽只是第二道（活性/占用）视图，读不到时绝不当成「被别人占了」。
     """
     card_id = auth["card_id"]
-    degraded = False
 
     db = SessionLocal()
     try:
@@ -573,8 +571,7 @@ async def heartbeat_task(task_id: str, req: HeartbeatRequest,
                                   headers={"Retry-After": "15"})
             # 降级：只承认「本轮没写成」，不改任务状态、不通知插件失败 —— 插件下一拍自然重试
             logger.warning(f"心跳期间下载槽不可用，本轮降级放行: card={card_id} task={task_id}")
-            degraded = True
-            state = "degraded"
+            state = "degraded"      # 返回体里的 degraded 由下面的分支直接给出
             lock = None
 
         if state == "renewed":

@@ -16,22 +16,14 @@ policy 变体用于对比：
   · pr2.5  = 只把「409 且 code=lost（或老服务端无 code 的 409）」当硬失效；5xx/超时按 comm-fail
   · v072   = 在 pr2.5 之上：requeued ⇒ 立即重 claim；frozen 判定用 mine；半本不 finalize
 
-用法：./.venv-xz/bin/python sim/run.py --scenario S2 --verbose
+用法：./.venv-xz/bin/python -u tools/sim/harness.py S2      # 入口在 harness.py，本模块只是它用的部件
 """
-import argparse
 import json
-import os
-import shutil
-import signal
-import socket
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
-import uuid
-from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -186,26 +178,9 @@ BEAT_TABLE = [
     ({"ok": False, "status": 0, "data": None}, "soft-lost"),
     (None, "soft-lost"),
 ]
-
-
-def classify_beat(res):
-    if not res:
-        return "soft-lost"
-    if res.get("status") == 401:
-        return "relogin"
-    if res.get("ok") and isinstance(res.get("data"), dict) and res["data"].get("success"):
-        return "renewed"
-    code = (res.get("data") or {}).get("code") if isinstance(res.get("data"), dict) else None
-    st = res.get("status")
-    if st == 409:
-        return "requeue" if code == "requeued" else "hard-lost"
-    return "hard-lost" if st == 404 else "soft-lost"
-
-
 def verify_against_plugin():
     """用 node 执行 background.js 里那份 classifyBeat，逐条比对 BEAT_TABLE。"""
     import re as _re
-    import subprocess
     js = REPO / "extension" / "background.js"
     if not js.exists() or not shutil.which("node"):
         return "跳过（缺 background.js 或 node）"

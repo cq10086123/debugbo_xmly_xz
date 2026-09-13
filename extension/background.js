@@ -227,32 +227,6 @@ async function getQueue() {
   if (!idx.length) return []
   return getTasksBatch(idx.map(item => item.task_id))
 }
-
-async function setQueue(q) {
-  await migrateStorage()
-  if (!q || !q.length) {
-    const idx = await getIndex()
-    for (const item of idx) await delTask(item.task_id)
-    await setIndex([])
-    return
-  }
-  const idx = []
-  for (const task of q) {
-    if (!task.task_id) continue
-    idx.push({
-      task_id: task.task_id,
-      album_id: task.album_id,
-      album_title: task.album_title,
-      source: task.source,
-      status: task.status,
-      paused: !!task.paused,
-      createdAt: task.createdAt || Date.now(),
-    })
-    await setTask(task)
-  }
-  await setIndex(idx)
-}
-
 // ── 旧 storage 工具（保留）──
 function cfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token'], r)) }
 async function authHeaders() {

@@ -25,8 +25,7 @@ from core import config as _config
 from core import cover as cover_mod
 from core.cover import extract_cover
 from core.account_manager import list_accounts
-from api.extension import (list_local_tasks, create_local_task, CreateTaskRequest,
-                       _release_slot)
+from api.extension import list_local_tasks, _release_slot
 
 logger = logging.getLogger(__name__)
 

@@ -22,11 +22,10 @@
   绝不因为读不懂就把锁判成过期而被人抢走（见 _lease_of）。
 """
 
-import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Optional
 
 from sqlalchemy.exc import IntegrityError
 
@@ -628,31 +627,3 @@ def busy_response(holder: Optional[dict]):
             "holder": holder,
         },
     )
-
-
-async def server_task_heartbeat_loop(
-    get_running: Callable[[], list[tuple[int, str]]],
-    interval: int = 30,
-) -> None:
-    """服务器任务心跳主循环（app 启动时 create_task 一次）。
-
-    get_running(): 返回 [(card_id, task_id)]，即当前所有 running/cancelling
-    的服务器下载任务（批量/单集等）。
-
-    关键语义：**只续约、绝不重新 acquire** —— 管理员强制释放后，
-    循环不能把槽抢回来（被取消的任务正在收尾，槽已归新持有者）。
-    """
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            for card_id, task_id in get_running():
-                if not card_id or not task_id:
-                    continue
-                ok, _ = heartbeat(card_id, task_id)
-                if not ok:
-                    logger.debug(f"下载槽心跳未生效（可能已被释放）: card={card_id} task={task_id}")
-            expire_stale()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("下载槽心跳循环异常")

@@ -15,7 +15,6 @@ import subprocess
 import sys
 import urllib.request
 import uuid
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -363,7 +362,8 @@ def S3_refused_then_restart(cards, toks, srv):
         return out[pol]["msg"] and "服务器侧完成" in out[pol]["msg"][0] and \
             out[pol]["done"] < out[pol]["total"]
     old_bad = bool(out["0.7.1"]["msg"])
-    p25_bad = bool(out["pr2.5"]["msg"]) or out["pr2.5"]["lost"] > 0
+    # pr2.5 只作为"只改状态码判定够不够"的对照观察，不硬断言（服务端演进后它的表现会变）
+    print(f"  [对照] pr2.5：谎报={bool(out['pr2.5']['msg'])} 被打回pending={out['pr2.5']['lost']}", flush=True)
     p26_clean = not [m for m in out["pr2.6"]["msg"] if "租约失效" in m or "其他设备" in m] \
         and not half_done("pr2.6") and out["pr2.6"]["done"] == out["pr2.6"]["total"]
     report("S3 服务进程被 kill 后重启 20s", old_bad and p26_clean,
@@ -435,7 +435,7 @@ def S5_two_devices_same_card(cards, toks):
     r_b = b.claim(tid)
     blocked = r_b.get("status") == 409
     time.sleep(4)
-    a_done0 = sum(x["done"] for x in a.progress.values())
+    print(f"  [观察] A 掉线前已完成 {sum(x['done'] for x in a.progress.values())} 集", flush=True)
     # A 整机掉线：停止心跳（不 stop 线程，仅让它不再推进）
     a.offline(3600)                                # 设备离线：一个请求都不发
     ttl = int(os.environ["DOWNLOAD_SLOT_LOCAL_TTL"])
@@ -448,7 +448,6 @@ def S5_two_devices_same_card(cards, toks):
     # A 回来：它本地的 claim 已失效 ⇒ 心跳被拒；必须停下来而不是与 B 并行落盘
     a._offline_until = 0
     time.sleep(14)
-    a_stopped = True
     a_files = set((STATE / "S5-A" / "dl" / tid).glob("*")) if (STATE / "S5-A" / "dl" / tid).exists() else set()
     b_files = set((STATE / "S5-B" / "dl" / tid).glob("*")) if (STATE / "S5-B" / "dl" / tid).exists() else set()
     both_writing = len(a_files & b_files) > 2      # 同一集被两台设备同时落盘 = 槽被破坏
@@ -545,7 +544,7 @@ def S8_repush(cards, toks):
                        for t in tids]})["data"]
 
     a = push("A800", [f"V1-{i}" for i in range(1, 11)])            # 第一卷
-    b = push("A800", [f"V2-{i}" for i in range(11, 21)])            # 第二卷（不同曲目）
+    push("A800", [f"V2-{i}" for i in range(11, 21)])                 # 第二卷（不同曲目）
     c = push("A800", [f"V1-{i}" for i in range(1, 11)])             # 完全相同 ⇒ 应幂等
     sv = server_tasks()
     eps = {}
@@ -588,7 +587,6 @@ SCENARIOS_ALL = None
 
 
 def main():
-    global VERBOSE, SCENARIOS_ALL
     ap = argparse.ArgumentParser()
     ap.add_argument("scen", nargs="*")
     ap.add_argument("--verbose", action="store_true")
