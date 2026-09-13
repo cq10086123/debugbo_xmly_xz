@@ -34,6 +34,20 @@
  *  13) 书完成后没有立即 tickClaim（只靠 1 分钟 alarm）→ 完成后立刻 scheduleClaimNext。
  *  14) 「全部下载」成功 claim 第一本就把 claimPending 清掉，autoDownload=false 时
  *      第二本不会接力。改为队列空才清。
+ *
+ * 心跳容错重构（2026-09-12，0.7.2）：修「下载中断（租约失效）」与「其他设备正在下载此任务」误报：
+ *  15) 心跳只要非 200 就当 claim 失效 ⇒ 反代 502/容器重启/服务器读不到租约（DB 抖动）都会
+ *      掐断在飞下载。改为 classifyBeat() 五分类：只有服务器明确 409/404（hard-lost）才停，
+ *      5xx 与连接失败按 soft-lost 处理（markStalled：暂停派发、保留 claimState 与已下内容）。
+ *  16) 服务器不可达时 handleClaimLost 拿**陈旧/空**列表推断「服务器侧已完成」⇒ 把只下了一半的
+ *      任务标成 done（静默漏集）。现在列表拉取失败（listFresh=false）一律保留现场不 finalize；
+ *      同一前提下也不再把陈旧列表里的 running 读成「其他设备正在下载此任务」（那句误报的出口）。
+ *      该处置抽成纯函数 decideClaimLost()，顺序由测试钉住（tests/test_plugin_beat_classify.py）。
+ *  19) serverApi 支持单次超时，心跳带上 20s 上限：服务器"连而不答"时不再把 tickClaim/pump
+ *      一起挂住（超时按「联系不上」处理，不改变任何业务结论）。
+ *  17) 新增 requeue 处置：服务器把离线任务打回 pending 后，插件立即重 claim 同一本继续，
+ *      不再取消全部在飞下载、也不再冻结一个租约周期。
+ *  18) 心跳节奏改用服务端下发的 beat_seconds（随租约联动），连续失败时收紧到 15s 快速重试。
  */
 importScripts('crypto.js', 'resolvers.js', 'sources.config.js')
 
@@ -63,6 +77,11 @@ const DEFAULT_SETTINGS = {
 
 const MAX_RETRY = 3                     // 重试次数兜底默认值（设置里可调）
 const TRACK_TIMEOUT = 30 * 60 * 1000    // 单集下载终端态等待上限（超时标记失败，防槽位泄漏）
+const RESOLVE_TIMEOUT_MS = 90 * 1000  // 单集"解析直链"上限。必须远小于 TRACK_TIMEOUT：
+                                      // 解析挂住时这一集既不失败也不完成，claim 心跳照发 ⇒ 下载槽被
+                                      // 无限期占住（别的设备一直看到「其他设备正在下载」，服务器 sweep
+                                      // 也不会触发，因为插件是活的）。90s 后走既有的 maxRetry 重试，
+                                      // 重试用尽即记为该集失败，任务照常收尾并释放槽。
 
 let offscreenReady = false
 let keepAliveActive = false
@@ -208,32 +227,6 @@ async function getQueue() {
   if (!idx.length) return []
   return getTasksBatch(idx.map(item => item.task_id))
 }
-
-async function setQueue(q) {
-  await migrateStorage()
-  if (!q || !q.length) {
-    const idx = await getIndex()
-    for (const item of idx) await delTask(item.task_id)
-    await setIndex([])
-    return
-  }
-  const idx = []
-  for (const task of q) {
-    if (!task.task_id) continue
-    idx.push({
-      task_id: task.task_id,
-      album_id: task.album_id,
-      album_title: task.album_title,
-      source: task.source,
-      status: task.status,
-      paused: !!task.paused,
-      createdAt: task.createdAt || Date.now(),
-    })
-    await setTask(task)
-  }
-  await setIndex(idx)
-}
-
 // ── 旧 storage 工具（保留）──
 function cfg() { return new Promise(r => chrome.storage.local.get(['serverUrl', 'token'], r)) }
 async function authHeaders() {
@@ -325,6 +318,7 @@ async function updateTrack(taskId, trackId, patch) {
 // ════════════════════════════════════════
 const STORAGE_CLAIM = 'xm_claim'
 let claimState = null          // {taskId, claimId, leaseSeconds, lastBeatAt, beatFails}
+let claimStateReady = Promise.resolve()   // 启动时指向 loadClaimState()；alarm 唤醒的冷启动会抢在它前面
 let claimPending = false       // 用户显式请求（全部下载/开始）尚未兑现
 let claimQueue = []            // 槽忙时排队的显式 claim（开始/重试失败集），FIFO
 let lastServerTasks = []       // 最近一次 GET /tasks（pending+running），claim 失效时重新同步用
@@ -338,7 +332,7 @@ const BEAT_COMM_FAIL_LIMIT = 3
 class ClaimLostError extends Error {}
 
 // 统一服务端请求：拼 URL/鉴权头，401 统一走 handleUnauthorized
-async function serverApi(path, { method = 'GET', body, params } = {}) {
+async function serverApi(path, { method = 'GET', body, params, timeoutMs = 0 } = {}) {
   const { serverUrl, token } = await cfg()
   if (!serverUrl || !token) return { ok: false, status: 0, data: null }
   let url = serverUrl + path
@@ -350,7 +344,20 @@ async function serverApi(path, { method = 'GET', body, params } = {}) {
   }
   const headers = { Authorization: 'Bearer ' + token }
   if (body) headers['Content-Type'] = 'application/json'
-  const r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined })
+  // timeoutMs：仅限"必须自己收口"的调用（心跳）。心跳挂在半空会让 tickClaim/pump 一起卡住，
+  // 进而让所有下载停摆；超时按「联系不上」处理（classifyBeat → soft-lost），不改变任何业务结论。
+  let signal, timer
+  if (timeoutMs > 0 && typeof AbortController === 'function') {
+    const ctl = new AbortController()
+    timer = setTimeout(() => ctl.abort(), timeoutMs)
+    signal = ctl.signal
+  }
+  let r
+  try {
+    r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal })
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
   let data = null
   try { data = await r.json() } catch (e) {}
   if (r.status === 401) {
@@ -373,6 +380,17 @@ async function clearClaimState() {
   await new Promise(r => chrome.storage.local.remove([STORAGE_CLAIM], r))
 }
 
+// 「这本任务是不是本机在下」的唯一可信判据。0.7.2 及以前用 claimState.taskId（SW 内存态）
+// 反推归属：claimState 尚未恢复 / 被浏览器冻结后为 null，于是"服务器显示 running 的任务"
+// 全部被判成别人的 —— 包括本机自己下的那本，弹出「其他设备正在下载此任务」、pump 跳过、
+// 重试按钮也被禁，直到服务器租约超时把任务打回 pending 才自愈（一台机器、独立卡密也会中招）。
+// 现在只信服务器下发的 mine（同会话指纹比对）；老服务器不下发 mine 时才回退到 claimState，
+// 且回退路径在 claimState 为空时**不**判定为别人（claim 端点还会给出权威的 busy，不会真抢）。
+function isOwnedHere(entry, claimedId) {
+  if (entry && typeof entry.mine === 'boolean') return entry.mine
+  return claimedId == null || !entry || entry.task_id === claimedId
+}
+
 // claim 一本书（指定 task_id 或让服务端选最早的 pending）
 async function claimTask(taskId) {
   const path = taskId
@@ -385,11 +403,18 @@ async function claimTask(taskId) {
     return { error: '无法连接服务器: ' + e.message }
   }
   if (res.status === 409) {
+    const code = (res.data && res.data.code) || ''
     const err = (res.data && (res.data.error || res.data.detail)) || ''
-    // 槽被其他任务占用 vs 本任务已不可 claim（running/done）——后者不能当「槽忙」重试
+    // 槽被其他任务占用 vs 本任务已不可 claim（running/done）——后者不能当「槽忙」无限重试。
+    // 0.7.2 起优先用服务端给的 code；老服务端只有中文文案 ⇒ 退回文案匹配（不降级、不误伤）。
+    if (code === 'already_claimed' || code === 'not_claimable' || code === 'task_gone') {
+      return { error: err || '任务不可 claim' }
+    }
+    if (code === 'busy') return { busy: true, holder: res.data && res.data.holder }
     if (/不可 claim|任务当前状态|任务不存在/.test(err)) return { error: err || '任务不可 claim' }
     return { busy: true, holder: res.data && res.data.holder }
   }
+  if (res.status === 404) return { error: (res.data && res.data.error) || '任务不存在' }
   if (!res.ok || !res.data || !res.data.success) {
     return { error: (res.data && (res.data.error || res.data.detail)) || `claim 失败 (${res.status})` }
   }
@@ -429,60 +454,166 @@ async function claimTask(taskId) {
     taskId: claimed.task_id,
     claimId: claimed.claim_id,
     leaseSeconds: claimed.lease_seconds || 300,
+    beatMs: (claimed.beat_seconds || 30) * 1000,   // 服务器按租约下发的节奏（老服务端无此字段则 30s）
     lastBeatAt: Date.now(),
     beatFails: 0,
   }
+  beatStalled = false
   await saveClaimState()
   console.log('[plugin] claim 成功', claimed.task_id, 'claim=', claimed.claim_id)
   return { ok: true, task: claimed }
 }
 
-// 心跳续约。返回 ok | comm-fail（网络失败）| lost（已被 handleClaimLost 处理）| gone（登录失效）
+/*
+ * 心跳响应 → 处置决定（纯函数，可单测：tests/test_plugin_beat_classify.py）
+ *
+ * 为什么要显式分五类：0.7.1 之前「只要不是 200 就当 claim 失效」，于是反代 502、容器重启、
+ * 服务器读不到下载槽（DB 抖动）全被当成「被别的设备抢走」，直接 cancel 在飞下载；
+ * 更糟的是随后拉状态也失败时，会拿**陈旧**列表推断成「服务器侧已完成」，把只下一半的任务
+ * 标成 done（漏集且不报错）。语义分层原则：基础设施异常 ≠ 所有权丢失。
+ *
+ *  renewed    续约成功（含 degraded=true：服务器暂时读不到租约状态，本轮不算失效）
+ *  relogin    401，登录态失效（handleUnauthorized 已处理，这里只清 claim）
+ *  requeue    服务器明确「任务已重新排队」⇒ 立刻重 claim 同一本，不要停、不要冻结
+ *  hard-lost  服务器明确拒绝（409/404，或老服务端不带 code 的 409）⇒ 必须停止本地下载
+ *  soft-lost  5xx、连接层失败、响应体不是 JSON ⇒ 只是联系不上：暂停派发，绝不 finalize
+ */
+function classifyBeat(res) {
+  if (!res) return 'soft-lost'
+  if (res.status === 401) return 'relogin'
+  if (res.ok && res.data && res.data.success) return 'renewed'
+  const code = (res.data && res.data.code) || null
+  if (res.status === 409) return code === 'requeued' ? 'requeue' : 'hard-lost'
+  if (res.status === 404) return 'hard-lost'          // 任务已不存在，继续下没意义
+  if (res.status >= 500 || res.status === 0) return 'soft-lost'
+  if (!res.ok && !res.data) return 'soft-lost'        // 反代 HTML 错误页（502/504 的常见形态）
+  return 'soft-lost'                                   // 其余（400/422 等）不可重试，也不许 finalize
+}
+
+const BEAT_TIMEOUT_MS = 20 * 1000   // 心跳单次上限：租约 300s，宁可本轮判"联系不上"也不要卡死派发
+// 联系不上服务器时的「暂停派发」标记：不清 claimState、不动已完成集、不 cancel 在飞下载
+let beatStalled = false
+let beatStalledAt = 0
+const STALLED_RETRY_MS = 5000      // 暂停期间的自我恢复探测节奏
+
+async function markStalled(taskId, why) {
+  if (!beatStalled) console.warn('[plugin] 心跳持续失败，暂停新章节派发：' + why)
+  beatStalled = true
+  if (!taskId) return
+  await withQueue(async () => {
+    const task = await getTask(taskId)
+    if (!task) return
+    task.errorMsg = '无法联系服务器，已暂停派发（已下载部分保留，恢复后自动继续）'
+    await setTask(task)
+    const idx = await getIndex()
+    upsertIndexEntry(idx, task)
+    await setIndex(idx)
+  })
+}
+
+// 心跳续约。返回 ok | soft-lost | requeued | lost（已被 handleClaimLost 处理）| gone（登录失效）
 async function heartbeatClaim() {
   if (!claimState) return 'no-claim'
   let res
   try {
     res = await serverApi(`/api/extension/tasks/${encodeURIComponent(claimState.taskId)}/heartbeat`,
-      { method: 'POST', body: { claim_id: claimState.claimId } })
+      { method: 'POST', body: { claim_id: claimState.claimId }, timeoutMs: BEAT_TIMEOUT_MS })
   } catch (e) {
-    claimState.beatFails = (claimState.beatFails || 0) + 1
-    if (claimState.beatFails >= BEAT_COMM_FAIL_LIMIT) {
-      console.warn('[plugin] 心跳长期不可达，租约必然已过期')
-      await handleClaimLost('心跳长期不可达，租约已过期')
-    }
-    return 'comm-fail'
+    // 连接层失败与「服务器明确拒绝」必须分开：前者只是联系不上
+    res = { ok: false, status: 0, data: null, error: String((e && e.message) || e) }
   }
-  if (res.status === 401) {   // handleUnauthorized 已清登录态
-    await clearClaimState()
-    return 'gone'
-  }
-  if (res.ok && res.data && res.data.success) {
+  const kind = classifyBeat(res)
+
+  if (kind === 'renewed') {
     claimState.lastBeatAt = Date.now()
     claimState.beatFails = 0
     if (res.data.lease_seconds) claimState.leaseSeconds = res.data.lease_seconds
+    if (res.data.beat_seconds) claimState.beatMs = res.data.beat_seconds * 1000
     await saveClaimState()
+    if (beatStalled) {
+      beatStalled = false
+      console.log('[plugin] 心跳恢复，继续派发')
+      setTimeout(() => pump(), 0)
+    }
+    if (res.data.degraded) console.warn('[plugin] 服务器暂时读不到租约状态，本轮未变更（下一拍重试）')
     return 'ok'
   }
-  await handleClaimLost((res.data && (res.data.error || res.data.detail)) || `心跳被拒 (${res.status})`)
-  return 'lost'
+  if (kind === 'relogin') {
+    await clearClaimState()
+    return 'gone'
+  }
+  if (kind === 'requeue') {
+    // 任务被租约清扫打回 pending：立刻重 claim 同一本就续上了，不该取消在飞下载、更不该冻结一周期
+    const tid = claimState.taskId
+    claimState = null
+    await saveClaimState()
+    console.warn('[plugin] 服务器已把任务重新排队，立即重新 claim：' + tid)
+    const r = await claimTask(tid)
+    if (!r || !r.ok) {
+      // 抢不回来（确实已被别的设备 claim）才走真正的失效流程
+      await handleClaimLost('重新排队后未能再次 claim')
+      return 'lost'
+    }
+    setTimeout(() => pump(), 0)
+    return 'requeued'
+  }
+  if (kind === 'hard-lost') {
+    await handleClaimLost((res.data && (res.data.error || res.data.detail)) || `心跳被拒 (${res.status})`)
+    return 'lost'
+  }
+  // soft-lost：累计到上限也只是「暂停派发」，下一个 alarm/进度事件再试；
+  // 若租约真过期到无可挽回，服务器会回 requeued / 409 lost，那时才做终局处理
+  claimState.beatFails = (claimState.beatFails || 0) + 1
+  console.warn(`[plugin] 心跳未成功（${res.status || 'net'}），连续第 ${claimState.beatFails} 次`)
+  if (claimState.beatFails >= BEAT_COMM_FAIL_LIMIT) {
+    await markStalled(claimState.taskId, `连续 ${claimState.beatFails} 次失败`)
+  }
+  return 'soft-lost'
 }
 
 async function maybeHeartbeat(force = false) {
   if (!claimState) return
-  if (!force && Date.now() - claimState.lastBeatAt < SERVER_BEAT_INTERVAL_MS) return
+  const gap = claimState.beatMs || SERVER_BEAT_INTERVAL_MS
+  // 连续失败时收紧重试节奏（最快 15s），别让「暂停」状态一直挂到下一个 1 分钟 alarm
+  const retry = (claimState.beatFails || 0) > 0 ? Math.min(gap, 15 * 1000) : gap
+  if (!force && Date.now() - claimState.lastBeatAt < retry) return
   await heartbeatClaim()
 }
 
 // claim 失效：停止该任务全部本地下载（另一设备可能接管同一任务，避免双份落盘），
 // 并与服务器重新同步该任务的归属状态
+/*
+ * claim 失效后，本地任务该怎么处置（纯函数，可单测：tests/test_plugin_beat_classify.py）
+ *
+ * 顺序即语义，两条不能换位置：
+ *  1) 本地已终态 ⇒ 什么都不改（把下完的书打回 pending 会整本重下一遍）；
+ *  2) 列表不可信 ⇒ 不许据"陈旧列表"猜任何结论。0.7.1 的病根就是把「上次列表里的 running」
+ *     当作「别的设备在下」——而那本往往正是本机自己在下的；
+ *  3) 之后才按服务器给的状态分：pending 可重排 / running 真被他人持有 / 终态则收尾。
+ */
+function decideClaimLost(s) {
+  if (!s) return 'keep-terminal'
+  if (s.localStatus === 'done' || s.localStatus === 'cancelled') return 'keep-terminal'
+  if (!s.listFresh) return 'pause-unknown'
+  if (s.serverStatus === 'pending') return 'resume-pending'
+  if (s.serverStatus === 'running') return 'freeze-other-device'
+  return 'finalize-server-done'
+}
+
 async function handleClaimLost(reason) {
   if (!claimState) return
   const taskId = claimState.taskId
   await clearClaimState()
-  // 先拉一次最新任务列表，保证同步判断准确
+  // 先拉一次最新任务列表，保证同步判断准确。
+  // ⚠️ listFresh：拉不到就必须**保留现场**——用陈旧/空列表判断会把「只下了一半」误推断成
+  // 「服务器侧已完成」→ 本地标 done → 用户以为下完了，其实漏集（0.7.1 的真实事故）。
+  let listFresh = false
   try {
     const r = await serverApi('/api/extension/tasks', {})
-    if (r.ok && r.data && Array.isArray(r.data.tasks)) lastServerTasks = r.data.tasks
+    if (r.ok && r.data && Array.isArray(r.data.tasks)) {
+      lastServerTasks = r.data.tasks
+      listFresh = true
+    }
   } catch (e) {}
   const cancelIds = []
   await withQueue(async () => {
@@ -495,22 +626,40 @@ async function handleClaimLost(reason) {
       }
       inflight.delete(taskId + '/' + tr.track_id)
     }
-    const serverPending = lastServerTasks.filter(t => t.status === 'pending').map(t => t.task_id)
-    const serverRunning = lastServerTasks.filter(t => t.status === 'running').map(t => t.task_id)
-    if (task.status === 'done' || task.status === 'cancelled') {
-      // 本地已终态：绝不能打回 pending（否则已下完的书会再下一遍）
-      task.claim_id = null
-      task.frozen = false
-    } else if (serverPending.includes(taskId)) {
-      task.status = 'pending'; task.claim_id = null; task.frozen = false
-    } else if (serverRunning.includes(taskId)) {
-      task.status = 'running'; task.claim_id = null; task.frozen = true
-      task.errorMsg = '其他设备正在下载此任务'
-    } else {
-      // 服务器侧已终态（done/cancelled）：本地标记结束，避免残留
-      task.status = 'done'; task.claim_id = null; task.frozen = false
-      if (!task.errorMsg) task.errorMsg = '下载中断（租约失效），任务可能已由服务器侧完成'
-      recomputeProgress(task)
+    const sv = lastServerTasks.find(t => t.task_id === taskId)
+    switch (decideClaimLost({
+      listFresh,
+      localStatus: task.status,
+      serverStatus: listFresh ? (sv ? sv.status : 'gone') : 'unknown',
+    })) {
+      case 'keep-terminal':
+        // 本地已终态：绝不能打回 pending（否则已下完的书会再下一遍）
+        task.claim_id = null
+        task.frozen = false
+        break
+      case 'pause-unknown':
+        // ⚠️ 这是「其他设备正在下载此任务」误报的真正出口：列表没拉到 ⇒ lastServerTasks 还是
+        //    上一次的内容，而里面那条 running 往往就是**本机自己**下的那本（0.7.1 正是据此谎报）。
+        //    状态不可知时既不猜归属、也不猜完成，只清 claim + 暂停派发，等下一拍重新判定。
+        task.claim_id = null
+        task.errorMsg = '无法联系服务器确认任务状态，已暂停（已下载部分保留）'
+        beatStalled = true
+        break
+      case 'resume-pending':
+        task.status = 'pending'; task.claim_id = null; task.frozen = false
+        task.errorMsg = ''
+        break
+      case 'freeze-other-device':
+        // 服务器明确说这本正被别的会话持有 ⇒ 这句提示是真话，该显示
+        task.status = 'running'; task.claim_id = null; task.frozen = true
+        task.errorMsg = '其他设备正在下载此任务'
+        break
+      case 'finalize-server-done':
+        // 服务器侧已终态（done/cancelled/任务不存在）：本地标记结束，避免残留
+        task.status = 'done'; task.claim_id = null; task.frozen = false
+        if (!task.errorMsg) task.errorMsg = '下载中断（租约失效），任务可能已由服务器侧完成'
+        recomputeProgress(task)
+        break
     }
     const idx = await getIndex()
     await setTask(task)
@@ -596,6 +745,7 @@ function scheduleClaimNext() {
 // 关键：finalizeTask 会先把本地 status 标成 done，此时仍必须 complete，
 // 绝不能只清本地 claimState（否则服务器槽不释放，下一本永远 409）。
 async function tickClaim() {
+  await claimStateReady      // 同上：恢复完再动 claim 状态机，避免冷启动重复 claim / 误判归属
   if (tickingClaim) { tickClaimQueued = true; return }
   tickingClaim = true
   try {
@@ -700,7 +850,8 @@ chrome.downloads.onChanged.addListener(handleDownloadChanged)
 // 启动：静默下载 UI → 恢复 claim 状态 → 拉取任务 → 校正历史下载状态（SW 被杀重启场景）→ claim 状态机 → 派发续传
 applySilentMode()
 pollAnnouncement().catch(() => {})
-loadClaimState()
+claimStateReady = loadClaimState()
+claimStateReady
   .then(() => pollBackend())
   .then(() => reconcileDownloads())
   .then(() => tickClaim())
@@ -782,6 +933,7 @@ async function pollAnnouncement() {
 // 0.7.0 新流程不再 ack：任务生命周期由 claim/heartbeat/complete/cancel 驱动，
 // pending 任务会持续出现在列表中直到被 claim（本插件幂等去重，重复出现无副作用）。
 async function pollBackend() {
+  await claimStateReady          // 归属判定依赖 claimState：不等它恢复完就会误判（见 isOwnedHere）
   const { serverUrl, token } = await cfg()
   if (!serverUrl || !token) return
   let data
@@ -811,7 +963,7 @@ async function pollBackend() {
       const tracks = (t.tracks || []).map(tr => ({
         ...tr, status: 'pending', error: '', downloadId: null,
       }))
-      const frozen = t.status === 'running' && t.task_id !== claimedId
+      const frozen = t.status === 'running' && !isOwnedHere(t, claimedId)
       const newTask = {
         ...t, tracks,
         status: frozen ? 'running' : 'pending',
@@ -842,6 +994,7 @@ async function pollBackend() {
       const task = await getTask(item.task_id)
       if (!task) continue
       if (task.task_id === claimedId) continue
+      const owned = isOwnedHere(st || { task_id: item.task_id }, claimedId)
       if (!st) {
         // 服务器侧已消失（done/cancelled/被删）：本地 pending 的移除；
         // 本地 done/cancelled 保留展示；frozen 展示任务保留（等待用户处理）
@@ -853,8 +1006,17 @@ async function pollBackend() {
         continue
       }
       let taskDirty = false
-      if (st.status === 'running' && task.status === 'pending') {
-        // 其他设备 claim 了它：本地转 frozen 展示，不下载
+      if (task.frozen && st.status === 'running' && owned) {
+        // 自愈：上一版把本机自己的任务误标成 frozen（claimState 为 null 时猜错），
+        // 服务器明确说这本就是本机 claim 的 ⇒ 解冻回 pending，交给 pump 继续 claim。
+        // 没有这段的话，升级后老用户存储里已经 frozen 的行会永久卡住（它只在服务器
+        // 把任务打回 pending 时才解冻，而它自己一直占着租约所以永远是 running）。
+        console.warn('[plugin] 服务器显示任务属于本机，解除误标的 frozen', task.task_id)
+        task.status = 'pending'; task.frozen = false; task.errorMsg = ''
+        item.status = 'pending'; item.frozen = false
+        taskDirty = true; changed = true
+      } else if (st.status === 'running' && task.status === 'pending' && !owned) {
+        // 其他设备 claim 了它：本地转 frozen 展示，不下载（服务器判定，不再靠猜）
         task.status = 'running'; task.frozen = true
         task.errorMsg = '其他设备正在下载此任务'
         item.status = 'running'; item.frozen = true
@@ -1036,6 +1198,23 @@ async function pickBookDispatch() {
 
 async function pump() {
   if (pumping) { pumpQueued = true; return }
+  // 联系不上服务器期间不开新集（在飞下载不打断、已完成不丢）；见 classifyBeat 的 soft-lost。
+  // ⚠️ 「暂停」必须可自愈：pump 也会被用户在 popup 点「开始/继续/重试」驱动，如果只是
+  //    看一眼标记就 return，服务器其实已经恢复而插件会永远不动。所以这里补一次强制心跳：
+  //    连上就当场解除暂停继续派发（heartbeatClaim 的 renewed 分支负责清标记）。
+  if (beatStalled) {
+    if (!claimState) {
+      beatStalled = false            // 已无活动 claim：没有「暂停」可言，直接放行
+    } else if (Date.now() - beatStalledAt >= STALLED_RETRY_MS) {
+      beatStalledAt = Date.now()
+      // ⚠️ 不能在 pump() 里 await 这一拍：服务器"连而不答"（反代挂起）时 fetch 永不返回，
+      //    会把整条派发链一起卡死。探测放后台，连上了再重新 pump。
+      heartbeatClaim().catch(() => {}).then(() => {
+        if (!beatStalled) setTimeout(() => pump(), 0)
+      })
+    }
+    return
+  }
   pumping = true
   let dispatched = false
   try {
@@ -1167,7 +1346,10 @@ async function runTrack(taskId, trackId) {
       })
       if (shouldSkip) return
 
-      const url = await resolveForTrack(task, tr, { serverUrl, token })
+      // D8：解析阶段以前是裸 await —— 挂住就永远挂着（见 RESOLVE_TIMEOUT_MS 的注释）
+      const url = await withTimeout(
+        resolveForTrack(task, tr, { serverUrl, token }),
+        RESOLVE_TIMEOUT_MS, '解析直链')
       if (!url) throw new Error('解析结果为空')
       const fname = buildFilename(task, tr, settings.downloadPrefix)
       console.log('[plugin] start download', trackId, fname)
@@ -1226,6 +1408,19 @@ function downgradeCertBrokenUrl(url) {
     u.protocol = 'http:'
     return u.toString()
   } catch (e) { return url.replace(/^https:\/\//, 'http://') }
+}
+
+// 给"可能永远不返回"的异步操作套上限（解析直链要等 cookie、等 offscreen 签名、等音源响应，
+// 任一环挂住就没有任何超时）。超时按"该次尝试失败"处理，交给调用方已有的 maxRetry 重试。
+function withTimeout(promise, ms, label) {
+  let timer = null
+  const guarded = Promise.resolve(promise).finally(() => { if (timer) clearTimeout(timer) })
+  return Promise.race([
+    guarded,
+    new Promise((_res, rej) => {
+      timer = setTimeout(() => rej(new Error((label || '操作') + `超时（${Math.round(ms / 1000)}s）`)), ms)
+    }),
+  ])
 }
 
 async function resolveForTrack(task, tr, ctx) {

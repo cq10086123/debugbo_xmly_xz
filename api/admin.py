@@ -623,6 +623,7 @@ async def force_release_download_lock(card_id: int, _: bool = Depends(get_curren
             if t is not None and t.status == "running":
                 t.status = "pending"
                 t.claim_id = None
+                t.claim_session = None    # 归属一并清除：插件侧靠 claim_id 被清空才会收到 requeued
                 t.claimed_at = None
                 t.heartbeat_at = None
                 t.lease_until = None

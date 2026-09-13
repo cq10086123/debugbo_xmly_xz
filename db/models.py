@@ -314,6 +314,12 @@ class LocalTask(Base):
     status = mapped_column(String(16), default="pending", nullable=False)
     # ── 下载槽租约字段（core/download_slot.py 维护，全部可空保证存量行兼容）──
     claim_id = mapped_column(String(32), nullable=True)          # 本次 claim 的凭证（插件心跳/完成/取消须携带）
+    # 本次 claim 的**会话指纹**（sha256(token)[:16]，绝不存原 token）。
+    # 用途：/api/extension/tasks 据此告诉每个插件「这条 running 任务是不是你 claim 的」（mine），
+    # 让插件不再靠「不是我的 claimState ⇒ 一定是别的设备」瞎猜（历史上这会在 SW 重启、
+    # 心跳 5xx、DB 抖动时误报「其他设备正在下载此任务」并冻结本机自己的任务）。
+    # NULL = 历史数据/无法归属 ⇒ 一律按「是本机」处理（fail-open，与 device_binding 的历史兼容策略一致）。
+    claim_session = mapped_column(String(32), nullable=True)
     progress = mapped_column(Text, nullable=True)                # JSON {total, done, failed}
     failed_list = mapped_column(Text, nullable=True)             # JSON [{episode, title, error}, ...]
     error = mapped_column(Text, nullable=True)

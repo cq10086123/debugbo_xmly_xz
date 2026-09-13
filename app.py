@@ -128,6 +128,9 @@ async def _slot_maintenance_loop(interval: int = 30):
             if swept:
                 logger.info(f"{swept} 个本地下载任务因租约过期回退为 pending")
             download_slot.expire_stale()
+            # 脏租约的孤儿槽（见 reap_orphan_locks）：只在"三重条件"下清理，正常情况恒为 0
+            if download_slot.reap_orphan_locks():
+                logger.warning("下载槽维护：回收了不可解析的孤儿锁行，建议核查该卡密的下载状态")
         except asyncio.CancelledError:
             raise
         except Exception:

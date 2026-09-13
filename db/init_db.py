@@ -135,6 +135,7 @@ def _migrate_local_task_columns():
     """轻量迁移：为已存在的 local_tasks 表补充下载槽租约相关列（全部可空，存量任务不受影响）。
 
     - claim_id      TEXT     本次 claim 凭证
+    - claim_session TEXT     本次 claim 的会话指纹（sha256(token)[:16]，用于「谁在下载」归属判定）
     - progress      TEXT     JSON {total, done, failed}
     - failed_list   TEXT     JSON 失败集列表
     - error         TEXT     错误/提示
@@ -145,6 +146,7 @@ def _migrate_local_task_columns():
     """
     needed = {
         "claim_id": "TEXT",
+        "claim_session": "TEXT",
         "progress": "TEXT",
         "failed_list": "TEXT",
         "error": "TEXT",

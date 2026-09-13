@@ -41,3 +41,9 @@ frontend/node_modules/
 
 # 旧代码归档（历史备份，非运行所需）
 archive/
+
+tools/sim/fault.json
+
+tools/sim/data/
+tools/sim/state/
+tools/sim/__pycache__/
